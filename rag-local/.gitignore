@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+data/
+vectorstore/
+.chromadb/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+eval-report*.json
+__pycache__/

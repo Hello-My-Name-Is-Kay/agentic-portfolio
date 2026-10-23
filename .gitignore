@@ -1,0 +1,71 @@
+# ─── Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ─── Virtual environments ──────────────────────────────────────────
+.venv/
+venv/
+.venv_*/
+env/
+
+# ─── Environment & Secrets ─────────────────────────────────────────
+.env
+.env.local
+.env.production
+*.key
+credentials.json
+credentials*.json
+service_account.json
+
+# ─── IDE / Editors ─────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+
+# ─── OS ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Testing / Coverage ────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.coverage
+coverage.xml
+
+# ─── Databases ─────────────────────────────────────────────────────
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite3
+
+# ─── Reports ───────────────────────────────────────────────────────
+eval*.json
+eval*.html
+guardrail-report*.json
+
+# ─── Project-specific: Vector stores ───────────────────────────────
+data/
+vectorstore/
+.chromadb/
+chroma_*/
+
+# ─── Git submodule leftovers (not used) ────────────────────────────
+.gitmodules
+
+# ─── Documentation generated / temp ────────────────────────────────
+*.log
+tmp/
+temp/

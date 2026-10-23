@@ -1,0 +1,19 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy --strict src
+      - run: pytest --cov=src --cov-fail-under=80
+      - run: pip-audit
+      - name: Eval gate
+        run: |
+          pytest tests/evals --json-report --json-report-file=eval.json
+          python scripts/check_eval_threshold.py eval.json --min-score 0.85
