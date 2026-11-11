@@ -19,10 +19,6 @@ class ExecutionError(TicketError):
     """SQL execution failure."""
 
 
-class DryRunError(TicketError):
-    """Error during dry-run mode."""
-
-
 class IdempotencyError(TicketError):
     """Idempotency key conflict."""
 

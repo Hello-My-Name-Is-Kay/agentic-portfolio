@@ -1,19 +1,8 @@
-# Ticket Automation Tool — Portfolio Project
-#
-# Python-based ticket queue automation tool with validated SQL
-# execution against SQLite, dry-run mode, audit logging, and
-# idempotency.
-#
-# This is a ground-up rebuild of a production ticket automation
-# system, built entirely on fake/demo data. No legacy code,
-# schemas, or content from any previous employer.
-#
-# Demonstrates: SQL injection prevention (parameterized queries),
-# idempotent execution, audit trails, dry-run safety, and
-# structured error handling.
-#
-# Business impact context: manual ticket processing at scale
-# (35,000-50,000 tickets/year, 4 min → 2 min per ticket).
+"""Ticket automation tool: a SQLite-backed support-ticket queue with a CLI.
+
+Fixed parameterized SQL for every operation, idempotency keys on writes,
+an audit log of every mutation, and synthetic demo data only.
+"""
 
 from __future__ import annotations
 

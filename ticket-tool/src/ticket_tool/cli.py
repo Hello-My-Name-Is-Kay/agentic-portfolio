@@ -17,14 +17,17 @@ Usage:
   python -m ticket_tool.cli update 1 --status resolved --resolution "Fixed"
   python -m ticket_tool.cli delete 5 --idem-key del-5-abc
   python -m ticket_tool.cli audit --ticket-id 1
+
+The database file is ``TICKET_DB_PATH`` (default ``tickets.db``); set
+``TICKET_ENABLE_AUDIT=false`` to turn off audit logging.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
-import uuid
 from datetime import datetime
 from typing import Any
 
@@ -35,13 +38,13 @@ from ticket_tool.models import Ticket, TicketUpdate
 log = get_logger("ticket.cli")
 
 
-def _add_seed_parser(subparsers) -> None:
+def _add_seed_parser(subparsers: Any) -> None:
     p = subparsers.add_parser("seed", help="Seed database with demo tickets")
     p.add_argument("--json", action="store_true", help="Output as JSON for LLM consumption")
     p.set_defaults(func=_cmd_seed)
 
 
-def _add_list_parser(subparsers) -> None:
+def _add_list_parser(subparsers: Any) -> None:
     p = subparsers.add_parser("list", help="List tickets")
     p.add_argument("--status", "-s", help="Filter by status")
     p.add_argument("--priority", "-p", help="Filter by priority")
@@ -50,14 +53,14 @@ def _add_list_parser(subparsers) -> None:
     p.set_defaults(func=_cmd_list)
 
 
-def _add_get_parser(subparsers) -> None:
+def _add_get_parser(subparsers: Any) -> None:
     p = subparsers.add_parser("get", help="Get ticket by ID")
     p.add_argument("ticket_id", type=int, help="Ticket ID")
     p.add_argument("--json", action="store_true", help="Output as JSON for LLM consumption")
     p.set_defaults(func=_cmd_get)
 
 
-def _add_create_parser(subparsers) -> None:
+def _add_create_parser(subparsers: Any) -> None:
     p = subparsers.add_parser("create", help="Create a new ticket")
     p.add_argument("--title", "-t", required=True, help="Ticket title")
     p.add_argument("--description", "-d", required=True, help="Ticket description")
@@ -70,7 +73,7 @@ def _add_create_parser(subparsers) -> None:
     p.set_defaults(func=_cmd_create)
 
 
-def _add_update_parser(subparsers) -> None:
+def _add_update_parser(subparsers: Any) -> None:
     p = subparsers.add_parser("update", help="Update a ticket")
     p.add_argument("ticket_id", type=int, help="Ticket ID")
     p.add_argument("--status", help="New status")
@@ -81,7 +84,7 @@ def _add_update_parser(subparsers) -> None:
     p.set_defaults(func=_cmd_update)
 
 
-def _add_delete_parser(subparsers) -> None:
+def _add_delete_parser(subparsers: Any) -> None:
     p = subparsers.add_parser("delete", help="Delete a ticket")
     p.add_argument("ticket_id", type=int, help="Ticket ID")
     p.add_argument("--idem-key", required=True, help="Idempotency key (required for safety)")
@@ -89,12 +92,18 @@ def _add_delete_parser(subparsers) -> None:
     p.set_defaults(func=_cmd_delete)
 
 
-def _add_audit_parser(subparsers) -> None:
+def _add_audit_parser(subparsers: Any) -> None:
     p = subparsers.add_parser("audit", help="View audit log")
     p.add_argument("--ticket-id", "-t", type=int, help="Filter by ticket ID")
     p.add_argument("--limit", "-l", type=int, default=100, help="Max entries")
     p.add_argument("--json", action="store_true", help="Output as JSON for LLM consumption")
     p.set_defaults(func=_cmd_audit)
+
+
+def _open_db() -> TicketDatabase:
+    """Open the database configured by TICKET_DB_PATH / TICKET_ENABLE_AUDIT."""
+    enable_audit = os.environ.get("TICKET_ENABLE_AUDIT", "true").lower() not in ("0", "false", "no")
+    return TicketDatabase(db_path=os.environ.get("TICKET_DB_PATH", "tickets.db"), enable_audit=enable_audit)
 
 
 def _print_json(data: Any) -> None:
@@ -109,23 +118,28 @@ def _print_json(data: Any) -> None:
         print(data)
 
 
-def _cmd_seed(args) -> int:
-    db = TicketDatabase()
-    db.seed_demo_data()
+def _cmd_seed(args: argparse.Namespace) -> int:
+    db = _open_db()
+    created = db.seed_demo_data()
     if args.json:
-        print(json.dumps({"status": "ok", "action": "seed", "message": "Database seeded with demo tickets"}))
+        print(json.dumps({"status": "ok", "action": "seed", "created": created}))
     else:
-        print("✓ Database seeded with demo tickets")
+        print(f"Seeded {created} new demo tickets")
     return 0
 
 
-def _cmd_list(args) -> int:
-    db = TicketDatabase()
+def _cmd_list(args: argparse.Namespace) -> int:
+    db = _open_db()
     result = db.list_tickets(status=args.status, priority=args.priority, limit=args.limit)
     if result.success:
         if args.json:
-            print(json.dumps({"status": "ok", "action": "list", "count": result.affected_rows, "tickets": result.data},
-                             indent=2, default=str))
+            print(
+                json.dumps(
+                    {"status": "ok", "action": "list", "count": result.affected_rows, "tickets": result.data},
+                    indent=2,
+                    default=str,
+                )
+            )
         else:
             print(f"Found {result.affected_rows} ticket(s):\n")
             for t in result.data:
@@ -139,8 +153,8 @@ def _cmd_list(args) -> int:
     return 0 if result.success else 1
 
 
-def _cmd_get(args) -> int:
-    db = TicketDatabase()
+def _cmd_get(args: argparse.Namespace) -> int:
+    db = _open_db()
     result = db.get_ticket(args.ticket_id)
     if result.success:
         if args.json:
@@ -155,7 +169,7 @@ def _cmd_get(args) -> int:
     return 0 if result.success else 1
 
 
-def _cmd_create(args) -> int:
+def _cmd_create(args: argparse.Namespace) -> int:
     ticket = Ticket(
         title=args.title,
         description=args.description,
@@ -164,7 +178,7 @@ def _cmd_create(args) -> int:
         priority=args.priority,
         category=args.category,
     )
-    db = TicketDatabase()
+    db = _open_db()
     result = db.create_ticket(ticket, idem_key=args.idem_key)
     if result.success:
         if args.json:
@@ -180,9 +194,9 @@ def _cmd_create(args) -> int:
     return 0 if result.success else 1
 
 
-def _cmd_update(args) -> int:
+def _cmd_update(args: argparse.Namespace) -> int:
     update = TicketUpdate(status=args.status, priority=args.priority, resolution=args.resolution)
-    db = TicketDatabase()
+    db = _open_db()
     result = db.update_ticket(args.ticket_id, update, idem_key=args.idem_key)
     if result.success:
         if args.json:
@@ -198,8 +212,8 @@ def _cmd_update(args) -> int:
     return 0 if result.success else 1
 
 
-def _cmd_delete(args) -> int:
-    db = TicketDatabase()
+def _cmd_delete(args: argparse.Namespace) -> int:
+    db = _open_db()
     result = db.delete_ticket(args.ticket_id, idem_key=args.idem_key)
     if result.success:
         if args.json:
@@ -214,13 +228,18 @@ def _cmd_delete(args) -> int:
     return 0 if result.success else 1
 
 
-def _cmd_audit(args) -> int:
-    db = TicketDatabase()
+def _cmd_audit(args: argparse.Namespace) -> int:
+    db = _open_db()
     result = db.get_audit_log(ticket_id=args.ticket_id, limit=args.limit)
     if result.success:
         if args.json:
-            print(json.dumps({"status": "ok", "action": "audit", "count": result.affected_rows, "entries": result.data},
-                             indent=2, default=str))
+            print(
+                json.dumps(
+                    {"status": "ok", "action": "audit", "count": result.affected_rows, "entries": result.data},
+                    indent=2,
+                    default=str,
+                )
+            )
         else:
             print(f"Found {result.affected_rows} audit entries:\n")
             _print_json(result.data)
@@ -233,11 +252,10 @@ def _cmd_audit(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse arguments and run the chosen command."""
     configure_logging(log_level="INFO")
 
-    parser = argparse.ArgumentParser(
-        description="Ticket Automation Tool — SQL-driven ticket queue management"
-    )
+    parser = argparse.ArgumentParser(description="Ticket Automation Tool — SQLite-backed ticket queue management")
     subparsers = parser.add_subparsers(dest="command", required=True)
     _add_seed_parser(subparsers)
     _add_list_parser(subparsers)
@@ -248,7 +266,8 @@ def main(argv: list[str] | None = None) -> int:
     _add_audit_parser(subparsers)
 
     args = parser.parse_args(argv)
-    return args.func(args)
+    result: int = args.func(args)
+    return result
 
 
 if __name__ == "__main__":

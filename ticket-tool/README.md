@@ -1,16 +1,16 @@
 # Ticket Automation Tool
 
-> **TL;DR** — SQLite-backed ticket queue with parameterized queries (no SQL injection), Pydantic-validated CRUD operations, idempotency key on every write (create/update/delete), full audit log of all mutations, CLI interface with 7 commands, 8 seeded demo tickets. Built entirely on synthetic data — no legacy code, schemas, or content from any employer.
+> **TL;DR** — SQLite-backed ticket queue with parameterized queries, Pydantic-validated CRUD, idempotency keys on every write (a repeated key replays the result; a reused key for a different write is refused), an audit log that survives deletes, a 7-command CLI, and 8 seeded demo tickets. Built entirely on synthetic data — no legacy code, schemas, or content from any employer.
 
 > **Tags:** `ticket-automation`, `sqlite`, `parameterized-sql`, `idempotency`, `audit-log`, `cli`, `pydantic`, `synthetic-data`
 
-Python-based ticket queue management with validated SQL execution, idempotency, dry-run mode, and full audit logging.
+Python-based ticket queue management with parameterized SQL, idempotent writes, and full audit logging.
 
 ## Why This Exists
 
-This is a ground-up Python rebuild of a production ticket automation system using only demo/fake data. It demonstrates parameterized SQL (never f-string SQL), idempotent writes, audit trails, and structured error handling. For an Agentic Engineer role, it shows domain expertise in ticket automation plus the security maturity to build it safely.
+A ground-up rebuild, on synthetic data, of the kind of ticket automation I built in production: the safety properties matter more than the features. Every value goes through `?` placeholders, every write can be retried safely with an idempotency key, and every mutation leaves an audit entry with before/after values. These are the properties an agent needs before it is allowed to write to a ticket queue.
 
-**Business context:** Manual ticket processing at 35,000–50,000 tickets per year, reduced from ~4 minutes to ~2 minutes per ticket through automation. (All data shown here is synthetic — no production data, schemas, or code from any previous employer.)
+**Context:** the production system this is modelled on handled 35,000–50,000 tickets per year and cut handling time from about 4 to about 2 minutes per ticket. Those figures describe that earlier system; nothing in this repo measures them. (All data here is synthetic — no production data, schemas, or code from any previous employer.)
 
 ## Architecture
 
@@ -54,8 +54,10 @@ pip install -e ".[dev]"
 ### Seed Demo Data
 
 ```bash
-python -m ticket_tool.cli seed
+python -m ticket_tool.cli seed     # safe to run twice
 ```
+
+The database file is `TICKET_DB_PATH` (default `./tickets.db`). Set `TICKET_ENABLE_AUDIT=false` to turn off the audit log.
 
 ## Output Format
 
@@ -73,7 +75,7 @@ Every command supports two output modes via the `--json` flag:
   "status": "ok | error",
   "action": "list | get | create | update | delete | seed | audit",
   "count": 8,
-  "ticket": { ... },         // single ticket object (get, create, update)
+  "ticket": [ { ... } ],     // one-row list (get, create, update)
   "tickets": [ ... ],         // array of ticket objects (list)
   "entries": [ ... ],         // audit entries (audit)
   "reason": "..."             // error message (if status=error)
@@ -128,11 +130,11 @@ python -m ticket_tool.cli audit --json
 
 | Feature | How It's Done |
 |---------|--------------|
-| No SQL injection | Parameterized queries only (`?` placeholders, never f-strings) |
-| Blocked SQL | DROP, TRUNCATE, ALTER, CREATE, GRANT, REVOKE rejected at model level |
-| Idempotent writes | Idempotency-Key deduplication on create/update/delete |
-| Audit trail | Every mutation logged with before/after changes |
-| Input validation | Pydantic models validate all inputs at boundaries |
+| No SQL injection | Values always go through `?` placeholders. The only dynamic SQL is the `SET` clause of an update, built from a fixed list of column names. |
+| Ad-hoc SQL guard | `SqlCommand` accepts one SELECT/INSERT/UPDATE/DELETE statement and rejects `;`-chained statements and DDL/admin keywords (DROP, TRUNCATE, ALTER, CREATE, GRANT, REVOKE, ATTACH, DETACH, PRAGMA). It is a validator for SQL coming from outside (e.g. an agent); the CLI itself never runs ad-hoc SQL. |
+| Idempotent writes | Each key is stored with a hash of the operation. Same key + same operation replays the stored result; same key + different operation is refused. |
+| Audit trail | Every create/update/delete is logged with before/after values and the idempotency key, and kept after the ticket is deleted. |
+| Input validation | Pydantic models validate ticket fields, status and priority values. |
 
 ## Testing
 
@@ -142,31 +144,19 @@ pytest --cov=src --cov-fail-under=80
 
 ### What the Tests Cover
 
-- **Ticket CRUD**: create, get, list (with/without filters), update, delete.
-- **Idempotency**: replaying the same key returns cached result without side effects.
-- **Audit log**: creation and updates generate audit entries.
-- **SQL validation**: valid SELECT/INSERT accepted, DROP/TRUNCATE/ALTER rejected, empty rejected.
-- **Error handling**: nonexistent tickets return structured errors.
+- **Ticket CRUD**: create, get, list (status/priority filters, limit), update (including no-op updates), delete.
+- **Idempotency**: replay returns the original result and does not re-apply; a reused key for a different write is refused; seeding twice does not duplicate.
+- **Audit log**: exact before/after changes for creates and updates; history kept after delete; can be disabled.
+- **SQL validation**: SELECT/INSERT accepted; DROP/TRUNCATE/ALTER, chained statements and blocked keywords inside DML rejected.
+- **CLI**: every command in JSON and text mode against a temp database; not-found errors and exit codes.
 
-## Intentional Omissions
+## Not built yet
 
-- No web UI (CLI-only by design for core logic visibility).
-- No real authentication (demo system with fake data).
-- No dry-run mode (planned for v0.2.0).
-- No SQL execution sandbox (validated input only — MVP scope).
+- No web UI (CLI only).
+- No authentication or per-user audit attribution (`performed_by` is always `system`).
+- No dry-run mode.
+- No executor for `SqlCommand`: ad-hoc SQL is validated, not run.
 
 ## Related Repos
 
 - [mock-booking-api](../mock-booking-api) — Companion API for the rental domain.
-
-## Definition of Done Checklist
-
-- [x] Idempotency key on create, update, and delete operations.
-- [x] Audit log with before/after changes for every mutation.
-- [x] Parameterized SQL only (no f-string SQL anywhere).
-- [x] Pydantic models at all boundaries (request validation, SQL command validation).
-- [x] Structured error responses (never raw tracebacks).
-- [x] `pytest --cov=src --cov-fail-under=80` passes.
-- [x] CHANGELOG.md has an entry.
-- [x] No secrets, no print (in production code), no commented-out code, no TODO.
-- [x] All data is synthetic — no legacy code, schemas, or content from any employer.

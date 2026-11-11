@@ -2,25 +2,26 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
-from pathlib import Path
+from typing import TYPE_CHECKING
 
+import pydantic
 import pytest
 
 from ticket_tool.engine import TicketDatabase
-from ticket_tool.models import Ticket, TicketUpdate, SqlCommand
+from ticket_tool.models import SqlCommand, Ticket, TicketUpdate
+from ticket_tool.seed import DEMO_TICKETS
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture
-def db() -> TicketDatabase:
-    """Create a temporary database for testing."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    db_path = tmp.name
-    tmp.close()
-    db = TicketDatabase(db_path=db_path)
-    yield db
-    os.unlink(db_path)
+def db(tmp_path: Path) -> TicketDatabase:
+    return TicketDatabase(db_path=str(tmp_path / "tickets.db"))
+
+
+def _ticket(title: str = "T") -> Ticket:
+    return Ticket(title=title, description="Test", customer_name="C", customer_email="c@t.com")
 
 
 class TestTicketCreation:
@@ -37,6 +38,7 @@ class TestTicketCreation:
         result = db.create_ticket(ticket)
         assert result.success
         assert result.data[0]["title"] == "Test ticket"
+        assert result.data[0]["priority"] == "high"
 
         # Get it back
         get_result = db.get_ticket(result.data[0]["id"])
@@ -53,9 +55,19 @@ class TestTicketCreation:
         key = "test-create-001"
         result1 = db.create_ticket(ticket, idem_key=key)
         result2 = db.create_ticket(ticket, idem_key=key)
-        # Both should succeed but only one ticket created (idempotent)
         assert result1.success
-        assert result2.success
+        assert result2 == result1
+        assert db.list_tickets().affected_rows == 1
+
+    def test_idempotency_key_reused_for_different_ticket_fails(self, db: TicketDatabase) -> None:
+        assert db.create_ticket(_ticket("first"), idem_key="k").success
+        result = db.create_ticket(_ticket("second"), idem_key="k")
+        assert not result.success
+        assert "different operation" in (result.error or "")
+        assert db.list_tickets().affected_rows == 1
+
+    def test_execution_time_is_measured(self, db: TicketDatabase) -> None:
+        assert db.create_ticket(_ticket()).execution_time_ms > 0
 
     def test_get_nonexistent_ticket(self, db: TicketDatabase) -> None:
         result = db.get_ticket(99999)
@@ -66,14 +78,24 @@ class TestTicketCreation:
         db.seed_demo_data()
         result = db.list_tickets()
         assert result.success
-        assert result.affected_rows >= 8  # 8 demo tickets seeded
+        assert result.affected_rows == len(DEMO_TICKETS) == 8
+
+    def test_seed_twice_does_not_duplicate(self, db: TicketDatabase) -> None:
+        assert db.seed_demo_data() == 8
+        assert db.seed_demo_data() == 0
+        assert db.list_tickets().affected_rows == 8
+
+    def test_list_limit_and_priority_filter(self, db: TicketDatabase) -> None:
+        db.seed_demo_data()
+        assert db.list_tickets(limit=3).affected_rows == 3
+        critical = db.list_tickets(priority="critical")
+        assert {t["title"] for t in critical.data} == {"Payment not processed", "Lost key replacement"}
 
     def test_list_with_status_filter(self, db: TicketDatabase) -> None:
         db.seed_demo_data()
         result = db.list_tickets(status="open")
-        assert result.success
-        for t in result.data:
-            assert t["status"] == "open"
+        assert result.affected_rows == 5
+        assert {t["status"] for t in result.data} == {"open"}
 
 
 class TestTicketUpdates:
@@ -88,8 +110,15 @@ class TestTicketUpdates:
         result = db.update_ticket(tid, update)
         assert result.success
 
-        get_result = db.get_ticket(tid)
-        assert get_result.data[0]["status"] == "resolved"
+        row = db.get_ticket(tid).data[0]
+        assert (row["status"], row["resolution"]) == ("resolved", "Completed")
+        assert row["resolved_at"] is not None
+
+    def test_update_without_changes_is_a_noop(self, db: TicketDatabase) -> None:
+        tid = db.create_ticket(_ticket()).data[0]["id"]
+        result = db.update_ticket(tid, TicketUpdate(status="open", priority="medium"))
+        assert (result.success, result.affected_rows) == (True, 0)
+        assert [e["action"] for e in db.get_audit_log(ticket_id=tid).data] == ["create"]
 
     def test_update_nonexistent(self, db: TicketDatabase) -> None:
         update = TicketUpdate(status="resolved")
@@ -105,9 +134,10 @@ class TestTicketUpdates:
         key = "test-update-001"
         update = TicketUpdate(status="resolved", resolution="Done")
         r1 = db.update_ticket(tid, update, idem_key=key)
+        db.update_ticket(tid, TicketUpdate(status="reopened"))
         r2 = db.update_ticket(tid, update, idem_key=key)
-        assert r1.success
-        assert r2.success
+        assert r2 == r1  # replayed, not re-applied
+        assert db.get_ticket(tid).data[0]["status"] == "reopened"
 
 
 class TestTicketDeletion:
@@ -135,9 +165,16 @@ class TestTicketDeletion:
 
         key = "del-test-003"
         r1 = db.delete_ticket(tid, idem_key=key)
-        r2 = db.delete_ticket(tid, idem_key=key)  # Idempotent — should report success
+        r2 = db.delete_ticket(tid, idem_key=key)  # replayed: reports the original success
         assert r1.success
-        assert r2.success
+        assert r2 == r1
+        assert not db.delete_ticket(tid, idem_key="another-key").success
+
+    def test_delete_keeps_audit_history(self, db: TicketDatabase) -> None:
+        tid = db.create_ticket(_ticket()).data[0]["id"]
+        db.update_ticket(tid, TicketUpdate(priority="high"))
+        assert db.delete_ticket(tid).success
+        assert [e["action"] for e in db.get_audit_log(ticket_id=tid).data] == ["delete", "update", "create"]
 
 
 class TestAuditLog:
@@ -149,18 +186,25 @@ class TestAuditLog:
         tid = cr.data[0]["id"]
 
         log_result = db.get_audit_log(ticket_id=tid)
-        assert log_result.success
-        assert log_result.affected_rows >= 1
+        assert log_result.affected_rows == 1
+        entry = log_result.data[0]
+        assert (entry["action"], entry["changes"]) == ("create", {"title": "Audit test"})
 
     def test_audit_logs_updates(self, db: TicketDatabase) -> None:
         ticket = Ticket(title="Audit update", description="Test", customer_name="C", customer_email="c@t.com")
         cr = db.create_ticket(ticket)
         tid = cr.data[0]["id"]
 
-        db.update_ticket(tid, TicketUpdate(status="resolved"))
-        log_result = db.get_audit_log(ticket_id=tid)
-        actions = [e["action"] for e in log_result.data]
-        assert "update" in actions
+        db.update_ticket(tid, TicketUpdate(status="resolved"), idem_key="u-1")
+        newest = db.get_audit_log(ticket_id=tid).data[0]
+        assert newest["action"] == "update"
+        assert newest["changes"] == {"status": {"from": "open", "to": "resolved"}}
+        assert newest["idempotency_key"] == "u-1"
+
+    def test_audit_can_be_disabled(self, tmp_path: Path) -> None:
+        db = TicketDatabase(db_path=str(tmp_path / "t.db"), enable_audit=False)
+        db.create_ticket(_ticket())
+        assert db.get_audit_log().affected_rows == 0
 
 
 class TestSqlCommandValidation:
@@ -187,6 +231,24 @@ class TestSqlCommandValidation:
             SqlCommand(sql="ALTER TABLE tickets ADD COLUMN x", params={})
 
     def test_rejects_empty(self) -> None:
-        import pydantic
-        with pytest.raises((ValueError, pydantic.ValidationError)):
+        with pytest.raises(pydantic.ValidationError):
             SqlCommand(sql="", params={})
+
+    @pytest.mark.parametrize(
+        "sql",
+        ["SELECT 1;DROP TABLE tickets", "SELECT * FROM tickets; DELETE FROM tickets", "select 1 ; pragma x"],
+    )
+    def test_rejects_multiple_statements(self, sql: str) -> None:
+        with pytest.raises(pydantic.ValidationError, match="single statement"):
+            SqlCommand(sql=sql)
+
+    def test_rejects_blocked_keyword_inside_dml(self) -> None:
+        with pytest.raises(pydantic.ValidationError, match="unsupported keyword: ATTACH"):
+            SqlCommand(sql="SELECT * FROM tickets WHERE 1 = 1 ATTACH 'x.db'")
+
+    def test_rejects_non_dml(self) -> None:
+        with pytest.raises(pydantic.ValidationError, match="must start with"):
+            SqlCommand(sql="VACUUM")
+
+    def test_trailing_semicolon_ok(self) -> None:
+        assert SqlCommand(sql="SELECT * FROM tickets;").sql == "SELECT * FROM tickets"

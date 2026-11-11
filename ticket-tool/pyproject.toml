@@ -1,7 +1,7 @@
 [project]
 name = "ticket-tool"
 version = "0.1.0"
-description = "SQL-driven ticket queue automation with idempotency, audit log, and dry-run mode"
+description = "SQLite-backed ticket queue CLI with idempotent writes and an audit log"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 
@@ -28,6 +28,12 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "B", "ARG", "C4", "D", "SIM", "TCH", "UP"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
 
 [tool.mypy]
 strict = true
