@@ -21,7 +21,9 @@ class ScorerError(EvalError):
 
 class ThresholdGateError(EvalError):
     """Eval score fell below the minimum threshold."""
+
     def __init__(self, score: float, threshold: float, metric: str) -> None:
+        """Record which metric failed and by how much."""
         self.score = score
         self.threshold = threshold
         self.metric = metric

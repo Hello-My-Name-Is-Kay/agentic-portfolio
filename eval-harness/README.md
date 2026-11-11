@@ -1,120 +1,99 @@
 # Eval Harness
 
-> **TL;DR** — Pytest-based evaluation framework with golden dataset (JSONL, 20+ Q&A), LLM-as-judge rubric scoring, recall@k + answer-accuracy metrics, and a CI gate that blocks merges on score regression. Applied to RAG and agent pipelines.
+> **TL;DR** — A small pytest-based evaluation library for LLM pipelines: a JSONL golden dataset (20 Q&A pairs about car-rental policies), substring answer-accuracy and document-recall metrics, an optional LLM-as-judge rubric scorer (Ollama), and a gate script that fails CI when scores fall below a threshold.
 
-> **Tags:** `eval`, `golden-dataset`, `llm-as-judge`, `ci-gate`, `recall@k`, `pytest`, `json-report`, `threshold-gate`
-
-A pytest-based evaluation framework for LLM pipelines. Golden datasets, LLM-as-judge rubrics, and a CI gate that blocks merges when scores drop below threshold.
+> **Tags:** `eval`, `golden-dataset`, `llm-as-judge`, `ci-gate`, `recall`, `pytest`
 
 ## Why This Exists
 
-The job posting explicitly names "evals gate every release" as a required signal. This repo delivers exactly that: a framework where every pipeline change is validated against a checked-in golden dataset, scored by an LLM judge, and blocked from merging if quality regresses. It's designed to wrap any pipeline — RAG, agent, or router — with minimal integration effort.
+Pipeline changes (prompts, retrieval settings, models) should be checked against a fixed set of questions before they ship. This repo is the scaffolding for that: load a checked-in golden dataset, score each answer, write a JSON report, and fail the build if quality drops.
+
+## What's in the box
+
+| Module | What it does |
+|--------|--------------|
+| `dataset.py` | Loads/writes the JSONL golden dataset with Pydantic validation; skips comments and reports malformed lines. |
+| `scorer.py` | `score_example()` computes per-example recall (fraction of expected docs retrieved) and answer accuracy (case-insensitive substring match). `EvalSummary` aggregates, writes `eval-report.json`, and `check_gate()` raises `ThresholdGateError` below the threshold. |
+| `judge.py` | `LlmJudge` sends question, answer and rubric to an Ollama model and returns a 0–1 score (clamped; non-JSON replies score 0). |
+| `scripts/check_eval_threshold.py` | Reads `eval-report.json`, exits 1 if answer accuracy or recall is below `--min-score`. |
 
 ## Architecture
 
 ```
-                          ┌───────────────────────┐
-                          │  Golden Dataset (JSONL) │  20+ Q&A pairs with rubrics
-                          └──────────┬────────────┘
-                                     │ load
-                                     ▼
-                     ┌─────────────────────────────┐
-                     │      Eval Harness Core       │
-                     │  ┌─────────┐  ┌───────────┐  │
-                     │  │ dataset │  │  scorer    │  │
-                     │  └─────────┘  └───────────┘  │
-                     │  ┌─────────┐                 │
-                     │  │  judge  │  (LLM-as-judge) │
-                     │  └─────────┘                 │
-                     └──────────────┬──────────────┘
-                                    │ report
-                                    ▼
-                     ┌─────────────────────────────┐
-                     │  eval-report.json            │
-                     │  check_eval_threshold.py     │  ← CI gate
-                     └─────────────────────────────┘
+  Golden dataset (JSONL, 20 Q&A + rubrics)
+              │ load_dataset()
+              ▼
+  your pipeline.answer(question) ──► score_example() ──► EvalSummary
+                                        (optional LlmJudge      │ to_json()
+                                         rubric score)          ▼
+                                                     eval-report.json
+                                                                │
+                                          scripts/check_eval_threshold.py  ← CI gate (exit 1 on regression)
 ```
 
 ## How to Run
-
-### Setup
 
 ```bash
 cd eval-harness
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env
+
+# All tests with coverage (80% gate)
+pytest
+
+# Eval suite only; writes eval-report.json
+pytest tests/evals
+
+# Gate on the report
+python scripts/check_eval_threshold.py eval-report.json --min-score 0.85
+python scripts/check_eval_threshold.py eval-report.json --min-score 0.85 --json
 ```
 
-### Run Tests
+### Evaluating a real pipeline
 
-```bash
-# Unit tests
-pytest tests/unit
+The eval suite in `tests/evals/` currently runs a stand-in pipeline that answers from the dataset itself, so it exercises the harness end to end (and a second test checks that a broken pipeline fails the gate). It does **not** evaluate a real RAG system yet. To evaluate one, replace the stand-in with your pipeline:
 
-# Eval suite (with fake pipeline)
-pytest tests/evals --json-report --json-report-file=eval.json
+```python
+from eval_harness.dataset import load_dataset
+from eval_harness.scorer import EvalSummary, score_example
 
-# Full suite with coverage
-pytest --cov=src --cov-fail-under=80
+examples = load_dataset("tests/fixtures/golden_dataset.jsonl")
+results = []
+for ex in examples:
+    answer, sources = my_pipeline.answer(ex.question)  # your code
+    results.append(score_example(ex, answer, sources))
+
+summary = EvalSummary(results, min_score=0.85)
+summary.to_json("eval-report.json")
+summary.check_gate()  # raises ThresholdGateError on regression
 ```
 
-## Output Formats
+`LlmJudge(model=..., base_url=...).evaluate(question, answer, ex.rubric)` gives a rubric score you can pass as `score_example(..., rubric_score=...)`. It is reported per example but is not part of the gate.
 
-The eval harness produces two forms of output:
-
-| Format | How | Consumer |
-|--------|-----|----------|
-| **JSON report** | `--json-report=eval.json` (pytest) or `scripts/check_eval_threshold.py eval.json` | CI gate, dashboards |
-| **JSON stdout** | `scripts/check_eval_threshold.py eval.json --json` | LLMs, scripts |
-| **Human-readable** | `scripts/check_eval_threshold.py eval.json` (default) | Terminal review |
-
-### JSON Report Schema
+## JSON Report Schema
 
 ```json
 {
   "total": 20,
-  "answer_accuracy": 0.95,
-  "overall_recall": 0.90,
+  "correct_answers": 20,
+  "answer_accuracy": 1.0,
+  "overall_recall": 1.0,
   "min_score": 0.85,
   "passed": true,
   "results": [
     {
-      "question": "What is the fuel policy?",
-      "expected_docs": ["policy_004_fuel.md"],
-      "retrieved_sources": ["policy_004_fuel.md"],
+      "question": "What is the minimum age to rent a vehicle?",
+      "expected_docs": ["policy_006_driver_requirements.md"],
+      "retrieved_sources": ["policy_006_driver_requirements.md"],
+      "expected_answer_contains": "21",
+      "recall": 1.0,
       "answer_ok": true,
-      "recall": 1.0
+      "rubric_score": null,
+      "latency_s": 0.0,
+      "error": null
     }
   ]
 }
-```
-
-### Run CI Gate
-
-```bash
-# Human-readable
-python scripts/check_eval_threshold.py eval.json --min-score 0.85
-
-# JSON output (for LLM consumption)
-python scripts/check_eval_threshold.py eval.json --min-score 0.85 --json
-```
-
-### Integration with a Real Pipeline
-
-```python
-from eval_harness.dataset import load_dataset
-from eval_harness.scorer import EvalSummary
-
-# Load dataset
-examples = load_dataset("tests/fixtures/golden_dataset.jsonl")
-
-# Run your pipeline against each example
-results = [evaluate(your_pipeline, ex) for ex in examples]
-
-# Check gate
-summary = EvalSummary(results, min_score=0.85)
-summary.check_gate()
 ```
 
 ## Eval Dataset
@@ -122,46 +101,29 @@ summary.check_gate()
 | Field | Type | Description |
 |-------|------|-------------|
 | `question` | string | The question to ask |
-| `expected_answer_contains` | string | Substring expected in answer |
-| `expected_docs` | list[string] | Expected source documents |
-| `rubric` | dict | LLM-as-judge evaluation criteria |
+| `expected_answer_contains` | string | Substring expected in the answer |
+| `expected_docs` | list[string] | Source documents that should be retrieved |
+| `rubric` | dict | `{"criteria": [...]}` for the LLM judge |
 
-**Size:** 20 questions covering all 21 policy documents.
-
-## Results
-
-| Metric | Current | Threshold |
-|--------|---------|-----------|
-| Answer accuracy | — *run eval to compute* | ≥ 0.85 |
-| Overall recall@k | — *run eval to compute* | ≥ 0.85 |
+20 questions, written against the policy documents in [rag-local](../rag-local).
 
 ## Testing
 
-### What the Tests Cover
+All tests run offline; the judge's HTTP calls go through `httpx.MockTransport`.
 
-- **Dataset loading:** empty files, missing files, parsing errors, round-trip serialization.
-- **Scoring:** recall computation, answer accuracy, summary aggregation, gate logic.
-- **Eval integration:** simulated pipeline run against full golden dataset, JSON report.
+- Dataset loading: missing/empty/malformed files, comment skipping, round trip.
+- Scoring: recall, substring matching, aggregation, gate failures on each metric.
+- Judge: request shape sent to Ollama, score parsing and clamping, HTTP and connection errors.
+- Gate script: pass, fail on each metric, missing report, JSON output.
+- Eval suite: stand-in pipeline passes the gate; a broken pipeline fails it.
 
-## Intentional Omissions
+## Not built yet
 
-- No web UI (CLI and CI integration by design).
-- No prompt A/B comparison (planned for v0.2.0).
-- No tool-trajectory assertions (added when agent projects exist).
+- Running the suite against the real `rag-local` pipeline in CI.
+- Prompt A/B comparison.
+- Tool-trajectory assertions for agents.
+- HTML reports.
 
 ## Related Repos
 
-- [rag-local](../rag-local) — RAG pipeline evaluated by this harness.
-- [llm-router](../llm-router) — multi-provider router evaluated by this harness.
-
-## Definition of Done Checklist
-
-- [x] All public functions have type hints; `mypy --strict src` passes.
-- [x] `ruff check .` and `ruff format --check .` pass.
-- [x] Every except block logs with context and raises typed exceptions.
-- [x] `pytest --cov=src --cov-fail-under=80` passes.
-- [x] Eval suite runs and `check_eval_threshold.py` gates the build.
-- [x] README documents current score and CI badge.
-- [x] CHANGELOG.md has an entry.
-- [x] No secrets, no print, no commented-out code, no TODO.
-- [x] Configuration via pydantic-settings with `.env.example`.
+- [rag-local](../rag-local) — the RAG pipeline the golden dataset was written for.

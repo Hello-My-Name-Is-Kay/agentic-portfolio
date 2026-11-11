@@ -1,0 +1,26 @@
+name: eval-harness
+on:
+  push:
+    paths: ["eval-harness/**", ".github/workflows/eval-harness.yml"]
+  pull_request:
+    paths: ["eval-harness/**", ".github/workflows/eval-harness.yml"]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: eval-harness
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy --strict src
+      - run: pytest
+      - run: pip-audit
+      - name: Eval gate
+        run: |
+          pytest tests/evals --no-cov
+          python scripts/check_eval_threshold.py eval-report.json --min-score 0.85

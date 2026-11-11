@@ -16,7 +16,6 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=5.0.0",
-    "pytest-json-report>=1.5.0",
     "ruff>=0.6.0",
     "mypy>=1.11.0",
     "pip-audit>=2.7.0",
@@ -29,6 +28,12 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "B", "ARG", "C4", "D", "SIM", "TCH", "UP"]
 
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+
 [tool.mypy]
 strict = true
 python_version = "3.11"
@@ -38,5 +43,4 @@ disallow_any_unimported = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"
-addopts = "--cov=src --cov-report=term-missing --cov-fail-under=75"
+addopts = "--cov=src --cov-report=term-missing --cov-fail-under=80"

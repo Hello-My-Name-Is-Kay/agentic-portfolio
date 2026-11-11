@@ -1,16 +1,19 @@
 """LLM-as-judge: use an LLM to evaluate answer quality against a rubric.
 
-This module sends the question, answer, and rubric to a judge LLM
-and parses the judgment to produce a score.
+This module sends the question, answer, and rubric to a judge LLM served by
+Ollama and parses the judgment into a score between 0.0 and 1.0.
 """
 
 from __future__ import annotations
 
 import json
-from eval_harness.logging import get_logger
+import time
 from typing import Any
 
+import httpx
+
 from eval_harness.errors import ScorerError
+from eval_harness.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -29,7 +32,7 @@ Do not include any text outside the JSON object.
 
 
 class LlmJudge:
-    """LLM-as-judge evaluator using Ollama."""
+    """LLM-as-judge evaluator using the Ollama chat API."""
 
     def __init__(
         self,
@@ -37,11 +40,22 @@ class LlmJudge:
         base_url: str = "http://localhost:11434",
         timeout_s: int = 60,
         temperature: float = 0.0,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
+        """Create a judge.
+
+        Args:
+            model: Ollama model name.
+            base_url: Ollama server URL.
+            timeout_s: Request timeout in seconds.
+            temperature: Sampling temperature for the judge.
+            transport: Optional httpx transport (used by tests to avoid the network).
+        """
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._timeout_s = timeout_s
         self._temperature = temperature
+        self._transport = transport
 
     def evaluate(self, question: str, answer: str, rubric: dict[str, Any]) -> float:
         """Evaluate an answer against a rubric.
@@ -49,13 +63,13 @@ class LlmJudge:
         Args:
             question: The original question.
             answer: The generated answer.
-            rubric: Dict with at least "criteria" key mapping to list of criteria strings.
+            rubric: Dict with at least a "criteria" key mapping to a list of criteria strings.
 
         Returns:
-            Score between 0.0 and 1.0.
+            Score between 0.0 and 1.0. A reply that is not valid JSON scores 0.0.
 
         Raises:
-            ScorerError: If the judge LLM fails to evaluate.
+            ScorerError: If the judge LLM call fails.
         """
         rubric_text = json.dumps(rubric, indent=2)
         user_prompt = (
@@ -65,37 +79,34 @@ class LlmJudge:
             "Score this answer according to the rubric."
         )
 
-        try:
-            result = self._call_llm(user_prompt, _JUDGE_SYSTEM_PROMPT)
-        except Exception as exc:
-            raise ScorerError(f"LLM judge call failed: {exc}") from exc
+        result = self._call_llm(user_prompt, _JUDGE_SYSTEM_PROMPT)
 
         try:
             data = json.loads(result)
         except json.JSONDecodeError:
             log.warning("judge.non_json", preview=result[:100])
             return 0.0
+        if not isinstance(data, dict):
+            log.warning("judge.non_object", preview=result[:100])
+            return 0.0
 
-        score = data.get("score", 0.0)
         try:
-            score = float(score)
+            score = float(data.get("score", 0.0))
         except (ValueError, TypeError):
             score = 0.0
 
         return max(0.0, min(1.0, score))
 
     def _call_llm(self, prompt: str, system_prompt: str) -> str:
-        """Call an LLM (via Ollama) for evaluation."""
-        import httpx
-        import time
-
+        """Call the judge model via Ollama and return the reply text."""
         payload = {
             "model": self._model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": self._temperature,
+            "format": "json",
+            "options": {"temperature": self._temperature},
             "stream": False,
         }
 
@@ -103,17 +114,20 @@ class LlmJudge:
         start = time.monotonic()
 
         try:
-            response = httpx.post(url, json=payload, timeout=httpx.Timeout(self._timeout_s))
-            response.raise_for_status()
-        except Exception as exc:
-            raise ScorerError(f"LLM call failed: {exc}") from exc
+            with httpx.Client(transport=self._transport, timeout=httpx.Timeout(self._timeout_s)) as client:
+                response = client.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise ScorerError(f"LLM judge call failed: {exc}") from exc
 
         elapsed = time.monotonic() - start
-        data = response.json()
-
-        content = data.get("message", {}).get("content", "")
-        log.info("judge.call", model=self._model,
-                 self._model, elapsed,
-                 data.get("prompt_eval_count", 0),
-                 data.get("eval_count", 0))
+        content = str(data.get("message", {}).get("content", ""))
+        log.info(
+            "judge.call",
+            model=self._model,
+            elapsed_s=round(elapsed, 3),
+            prompt_tokens=data.get("prompt_eval_count", 0),
+            completion_tokens=data.get("eval_count", 0),
+        )
         return content

@@ -1,14 +1,9 @@
-# Eval Harness — Portfolio Project
-#
-# A pytest-based evaluation framework for LLM pipelines.
-# Supports golden datasets, LLM-as-judge rubrics, tool-trajectory
-# assertions, and prompt A/B comparison.
-#
-# Integrates with GitHub Actions: failing the build when eval
-# scores drop below a configurable threshold.
-#
-# Designed to gate every release — the "evals gate every release"
-# signal from the job posting.
+"""Eval harness: golden-dataset evaluation for LLM pipelines.
+
+Loads a JSONL golden dataset, scores pipeline answers (substring accuracy and
+document recall, optionally an LLM-as-judge rubric score), and fails a CI job
+when scores drop below a threshold.
+"""
 
 from __future__ import annotations
 

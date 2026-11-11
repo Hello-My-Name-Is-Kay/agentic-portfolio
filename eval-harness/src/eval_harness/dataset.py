@@ -10,13 +10,13 @@ Each line is a JSON object with:
 from __future__ import annotations
 
 import json
-from eval_harness.logging import get_logger
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from eval_harness.errors import DatasetError
+from eval_harness.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -27,8 +27,8 @@ class EvalExample(BaseModel):
     question: str = Field(..., description="The question to ask the pipeline")
     expected_answer_contains: str = Field(..., description="Substring expected in the answer")
     expected_docs: list[str] = Field(default_factory=list, description="Expected source document filenames")
-    rubric: dict = Field(default_factory=dict, description="LLM-as-judge rubric criteria")
-    metadata: dict = Field(default_factory=dict, description="Arbitrary metadata")
+    rubric: dict[str, Any] = Field(default_factory=dict, description="LLM-as-judge rubric criteria")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="Arbitrary metadata")
 
 
 def load_dataset(path: str) -> list[EvalExample]:
@@ -65,8 +65,7 @@ def load_dataset(path: str) -> list[EvalExample]:
             errors.append(f"Line {lineno}: {exc}")
 
     if not examples:
-        raise DatasetError(f"No valid examples found in {path}" +
-                           (f" ({len(errors)} parse errors)" if errors else ""))
+        raise DatasetError(f"No valid examples found in {path}" + (f" ({len(errors)} parse errors)" if errors else ""))
 
     log.info("dataset.loaded", count=len(examples), path=path)
     return examples
