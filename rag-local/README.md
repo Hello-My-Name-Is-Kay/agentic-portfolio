@@ -1,6 +1,6 @@
 # RAG on Local Models
 
-> **TL;DR** — Retrieval-Augmented Generation over 21 rental-policy documents. Chroma vector store + sentence-transformers for embedding, Ollama for generation, CLI for interaction, recall@k for measurement. Runs entirely on local infrastructure. No external API dependencies.
+> **TL;DR** — Retrieval-Augmented Generation over 21 rental-policy documents. Chroma (cosine) + sentence-transformers embeddings, Ollama for generation, answers cite `[Document N]`, and the pipeline refuses when nothing passes a similarity threshold. Measured retrieval recall@5 = **0.905** on 20 golden questions, gated in CI. Runs on local infrastructure; the only download is the embedding model on first use.
 
 > **Tags:** `rag`, `chroma`, `ollama`, `sentence-transformers`, `recall@k`, `local-llm`, `cli`, `pydantic-validation`, `retrieval-guardrails`, `structured-logging`, `ci-eval-gate`
 
@@ -8,7 +8,7 @@ Retrieval-Augmented Generation engine over rental-policy documents using Chroma 
 
 ## Why This Exists
 
-This project demonstrates a production-grade RAG pipeline that runs entirely on local infrastructure — no external API dependencies. It showcases retrieval guardrails (confidence threshold refusal), measured retrieval quality (recall@k), citations in every answer, and structured observability. For an Agentic Engineering role, it proves competence with: embedding pipelines, vector stores, chunking strategies, LLM integration, and the principle that every generated answer must be grounded in retrieved evidence.
+A RAG pipeline that runs on local infrastructure: no hosted LLM or embedding API. The point is that an answer should be grounded in retrieved evidence or not given at all, and that retrieval quality is measured instead of assumed. It covers chunking, embedding, a vector store, a similarity-threshold refusal, cited answers, and a recall gate in CI.
 
 ## Architecture
 
@@ -24,12 +24,12 @@ This project demonstrates a production-grade RAG pipeline that runs entirely on 
                           │ chunk
                           ▼
               ┌─────────────────────┐
-              │  Chroma Vector Store │  (sentence-transformers embeddings)
+              │  Chroma Vector Store │  cosine distance, MiniLM-L6 embeddings
               └──────┬──────────────┘
                      │ search (top-k)
                      ▼
               ┌─────────────────────┐
-              │   Retriever         │  Filters by min_relevance_score
+              │   Retriever         │  drops chunks with cosine sim < 0.35
               └──────┬──────────────┘
                      │ context + question
                      ▼
@@ -62,7 +62,11 @@ pip install -e ".[dev]"
 cp .env.example .env   # edit if needed
 ```
 
+The embedding model (`all-MiniLM-L6-v2`, ~90 MB) is downloaded from Hugging Face the first time you ingest or query.
+
 ### Ingest Documents
+
+Chunks get stable IDs (`<filename>#<n>`), so re-running ingest updates the index instead of duplicating it.
 
 ```bash
 # Human-readable output
@@ -120,22 +124,24 @@ On error, the JSON response contains `"status": "error"`, a `"code"` field (e.g.
 
 | Metric | Value |
 |--------|-------|
-| Questions in dataset | 20 |
-| Overall recall@k | — *run `scripts/eval_rag.py` to compute* |
-| Answer accuracy | — *run `scripts/eval_rag.py` to compute* |
-| Min score gate | 0.85 |
+| Questions in dataset | 20 (21 expected source documents) |
+| Retrieval recall@5 (cosine ≥ 0.35) | **0.905** — 19 of 21 expected documents |
+| Answer accuracy | not measured yet (needs a running Ollama; not run in CI) |
+| CI gate | recall@5 ≥ 0.85 |
+
+Measured with `scripts/eval_rag.py --retrieval-only`. The miss is "Can I use the vehicle for international travel?": no chunk reaches the 0.35 similarity threshold, so the pipeline refuses instead of answering. That is the threshold doing its job, but it is also a retrieval gap worth fixing (e.g. a lower threshold or hybrid keyword search).
 
 ### Run Evaluation
 
 ```bash
+# Retrieval only: indexes docs/ in a temp dir with the real embedding model; no LLM needed (what CI runs)
+python scripts/eval_rag.py --retrieval-only --min-score 0.85
+
+# Full pipeline against your ingested index and a running Ollama: also checks answer accuracy
 python scripts/eval_rag.py --min-score 0.85
 ```
 
-The eval script:
-1. Runs all 20 questions through the RAG pipeline.
-2. Computes recall@k: fraction of expected source documents retrieved.
-3. Checks answer quality: does the answer contain the expected substring?
-4. Fails the build if recall < threshold (CI gate).
+The script writes `eval-report.json` and exits 1 if recall (and, in full mode, answer accuracy) is below `--min-score`.
 
 ## Testing
 
@@ -143,38 +149,30 @@ The eval script:
 pytest --cov=src --cov-fail-under=80
 ```
 
-### What the Tests Cover
+Unit tests run offline: the sentence-transformers model is replaced by a fake, Ollama by `httpx.MockTransport`, and pipeline tests use a real Chroma index in a temp dir with a deterministic bag-of-words embedder.
 
-- **Chunker**: empty input, single doc, multi-chunk split, overlap constraints, metadata inheritance.
+- **Chunker**: size limit, overlap between chunks, paragraph-boundary preference, termination (regression for an infinite loop), metadata.
 - **Loader**: directory discovery, nonexistent paths, empty files, recursion.
-- **Embedder**: empty text rejection, dimension consistency, batch embedding.
-- **Retriever**: relevance threshold filtering, no-relevant-docs path, empty query guard.
+- **Embedder**: normalisation, batching, error wrapping.
+- **Store**: cosine distance, upsert without duplicates, validation, error wrapping.
+- **Retriever**: cosine scoring, sorting, threshold filtering, refusal, error wrapping.
+- **Generator**: Ollama request shape (`options.num_predict`/`temperature`), retries on 5xx/timeouts/connection errors, no retry on 4xx, malformed bodies.
+- **Pipeline**: ingest of the real 21 docs is idempotent; cited answer; refusal on an unrelated question.
+- **CLI**: ingest/query in JSON and text, refusal vs error exit codes, interactive mode.
 
-## Intentional Omissions
+## Dependency audit
+
+`pip-audit` in CI ignores four chromadb advisories (PYSEC-2026-311, -3813, -3814, -3815). All of them are in the Chroma HTTP server's endpoints and RBAC provider; this project only uses the embedded `PersistentClient` and never starts a Chroma server. No fixed chromadb release exists yet, so the ignores should be removed when one ships.
+
+## Not built yet
 
 - No web UI or API endpoint (CLI only by design — this shows the core RAG logic).
-- No re-ranking or hybrid search (a single embedding model is sufficient for MVP scope).
+- No re-ranking or hybrid (keyword + dense) search; retrieval is dense-only.
 - No streaming output (the Ollama generator uses non-streaming for simplicity).
 - No LangChain dependency (direct Chroma + sentence-transformers API for clarity).
+- Generation goes straight to Ollama; it does not use [llm-router](../llm-router) yet.
 
 ## Related Repos
 
-- [eval-harness](../eval-harness) — pytest-based eval suite with LLM-as-judge.
-- [llm-router](../llm-router) — multi-provider fallback chain.
-
-## Definition of Done Checklist
-
-- [x] All public functions have type hints; `mypy --strict src` passes.
-- [x] `ruff check .` and `ruff format --check .` pass.
-- [x] Every except block logs with context and re-raises a typed exception.
-- [x] Every external call (Ollama) has timeout and retry policy.
-- [x] Every LLM call logs provider, latency, tokens with request_id.
-- [x] Every failure branch has a corresponding test.
-- [x] `pytest --cov=src --cov-fail-under=80` passes.
-- [x] Eval suite: `scripts/eval_rag.py` runs and has threshold gate.
-- [x] Prompts in `src/` are versioned inline.
-- [x] README updated with results and instructions.
-- [x] CHANGELOG.md has an entry.
-- [x] No secrets, no print, no commented-out code, no TODO.
-- [x] Configuration via pydantic-settings with `.env.example`.
-- [x] New dependencies pinned in `pyproject.toml`.
+- [eval-harness](../eval-harness) — the same 20 golden questions as a reusable eval library with an LLM-as-judge scorer.
+- [guardrails](../guardrails) — attack cases written against this pipeline.

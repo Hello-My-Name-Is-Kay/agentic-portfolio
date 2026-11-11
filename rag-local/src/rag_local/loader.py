@@ -6,11 +6,11 @@ with source metadata.
 
 from __future__ import annotations
 
-from rag_local.logging import get_logger
 from pathlib import Path
 
 from rag_local.chunker import Document
 from rag_local.errors import DocumentIngestionError
+from rag_local.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -45,7 +45,7 @@ def load_documents(source_dir: str) -> list[Document]:
     for file_path in md_files:
         try:
             content = file_path.read_text(encoding="utf-8")
-        except (IOError, PermissionError) as exc:
+        except (OSError, PermissionError) as exc:
             log.warning("loader.unreadable", path=str(file_path), error=str(exc))
             continue
 

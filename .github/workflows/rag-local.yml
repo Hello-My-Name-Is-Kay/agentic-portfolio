@@ -1,0 +1,32 @@
+name: rag-local
+on:
+  push:
+    paths: ["rag-local/**", ".github/workflows/rag-local.yml"]
+  pull_request:
+    paths: ["rag-local/**", ".github/workflows/rag-local.yml"]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rag-local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev]"  # CPU-only torch
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy --strict src
+      - run: pytest
+      # These chromadb advisories affect the Chroma HTTP server (REST endpoints, RBAC provider),
+      # which this project never runs: it only uses the embedded PersistentClient. No fixed
+      # chromadb release exists yet; remove the ignores once one does.
+      - run: >-
+          pip-audit
+          --ignore-vuln PYSEC-2026-311
+          --ignore-vuln PYSEC-2026-3813
+          --ignore-vuln PYSEC-2026-3814
+          --ignore-vuln PYSEC-2026-3815
+      - name: Retrieval eval gate (real embedding model, no LLM)
+        run: python scripts/eval_rag.py --retrieval-only --min-score 0.85

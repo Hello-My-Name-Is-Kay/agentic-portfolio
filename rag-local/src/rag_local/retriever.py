@@ -1,17 +1,20 @@
 """Retrieval pipeline: embed query → search store → score results.
 
-Includes confidence-based guardrails: if the top result's distance
-exceeds a threshold, the pipeline returns empty to prevent hallucination.
+Includes a confidence guardrail: chunks whose cosine similarity to the
+query is below ``min_relevance_score`` are dropped, and if none remain the
+retriever raises NoRelevantDocumentsError so the pipeline can refuse to answer.
 """
 
 from __future__ import annotations
 
-from rag_local.logging import get_logger
-from typing import Protocol
+from typing import TYPE_CHECKING, Any
 
-from rag_local.embedder import Embedder
-from rag_local.errors import NoRelevantDocuments, RetrievalError
-from rag_local.store import VectorStore
+from rag_local.errors import NoRelevantDocumentsError, RetrievalError
+from rag_local.logging import get_logger
+
+if TYPE_CHECKING:
+    from rag_local.embedder import Embedder
+    from rag_local.store import VectorStore
 
 log = get_logger(__name__)
 
@@ -19,13 +22,15 @@ log = get_logger(__name__)
 class RetrievedChunk:
     """A single retrieved chunk with relevance information."""
 
-    def __init__(self, text: str, metadata: dict, score: float, distance: float) -> None:
+    def __init__(self, text: str, metadata: dict[str, Any], score: float, distance: float) -> None:
+        """Store the chunk, its cosine similarity (``score``) and cosine distance."""
         self.text = text
         self.metadata = metadata
-        self.score = score  # similarity score (1 - distance for cosine)
+        self.score = score
         self.distance = distance
 
     def __repr__(self) -> str:
+        """Return a short summary with score and source."""
         return f"RetrievedChunk(score={self.score:.3f}, source={self.metadata.get('source', 'unknown')})"
 
 
@@ -43,6 +48,14 @@ class Retriever:
         top_k: int = 5,
         min_relevance_score: float = 0.35,
     ) -> None:
+        """Configure the retriever.
+
+        Args:
+            embedder: Embeds the query (must match the embedder used at ingest).
+            store: Vector store using cosine distance.
+            top_k: Default number of chunks to fetch.
+            min_relevance_score: Minimum cosine similarity (0-1) for a chunk to count.
+        """
         if top_k < 1:
             raise ValueError("top_k must be >= 1")
         if not 0.0 <= min_relevance_score <= 1.0:
@@ -64,7 +77,7 @@ class Retriever:
             List of RetrievedChunk objects sorted by relevance (highest first).
 
         Raises:
-            NoRelevantDocuments: If no documents score above the threshold.
+            NoRelevantDocumentsError: If no documents score above the threshold.
             RetrievalError: If embedding or search fails.
         """
         if not query or not query.strip():
@@ -84,11 +97,8 @@ class Retriever:
 
         chunks: list[RetrievedChunk] = []
         for result in raw_results:
-            distance = result.get("distance", 1.0)
-            # Chroma returns L2 distance by default; convert to similarity score
-            # For cosine distance: score = 1 - distance (if using cosine, distance is in [0,2])
-            # For L2: score = 1 / (1 + distance) -> simpler: use normalized score
-            score = max(0.0, 1.0 - distance)
+            distance = float(result.get("distance", 1.0))
+            score = max(0.0, 1.0 - distance)  # cosine distance -> cosine similarity
 
             chunks.append(
                 RetrievedChunk(
@@ -99,18 +109,16 @@ class Retriever:
                 )
             )
 
-        # Filter by relevance threshold
+        chunks.sort(key=lambda c: c.score, reverse=True)
         relevant = [c for c in chunks if c.score >= self._min_relevance_score]
 
         if not relevant:
-            log.warning(
-                "No relevant documents above threshold %.2f (best score: %.3f)",
-                self._min_relevance_score,
-                chunks[0].score if chunks else 0.0,
-            )
-            raise NoRelevantDocuments(
-                f"No documents scored above relevance threshold {self._min_relevance_score:.2f}. "
-                f"Best score: {chunks[0].score:.3f}" if chunks else "No documents found at all."
+            best = chunks[0].score if chunks else 0.0
+            log.warning("retriever.no_relevant", threshold=self._min_relevance_score, best_score=round(best, 3))
+            if not chunks:
+                raise NoRelevantDocumentsError("No documents found at all.")
+            raise NoRelevantDocumentsError(
+                f"No documents scored above relevance threshold {self._min_relevance_score:.2f}. Best score: {best:.3f}"
             )
 
         return relevant

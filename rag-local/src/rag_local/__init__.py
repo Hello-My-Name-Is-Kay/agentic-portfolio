@@ -1,15 +1,8 @@
-# RAG on Local Models — Portfolio Project
-#
-# Retrieval-Augmented Generation engine using Chroma vector store and
-# Ollama-hosted local language models. Answers questions by grounding
-# them in a corpus of rental-policy documents.
-#
-# This project demonstrates:
-#   - Local-first RAG pipeline (no external API dependencies)
-#   - Citations in every answer for auditability
-#   - Confidence-threshold guardrails (refuses when unsure)
-#   - Measured retrieval quality (recall@k)
-#   - Structured logging, typed errors, and exhaustive tests
+"""RAG on local models: answer rental-policy questions from a Chroma index.
+
+Embeddings come from a local sentence-transformers model and answers from an
+Ollama-hosted model. Answers cite the retrieved documents, and the pipeline
+refuses when no chunk passes a similarity threshold.
 """
 
 from __future__ import annotations

@@ -9,16 +9,21 @@ The main RAG class coordinates the full pipeline:
 
 from __future__ import annotations
 
-from rag_local.logging import get_logger
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from rag_local.chunker import Document
+from rag_local.chunker import RecursiveCharacterChunker
 from rag_local.config import Settings
-from rag_local.embedder import SentenceTransformerEmbedder
-from rag_local.errors import GenerationError, NoRelevantDocuments, RagError
-from rag_local.generator import OllamaGenerator
-from rag_local.retriever import Retriever, RetrievedChunk
-from rag_local.store import ChromaVectorStore
+from rag_local.errors import GenerationError, NoRelevantDocumentsError, RagError
+from rag_local.logging import get_logger
+from rag_local.retriever import RetrievedChunk, Retriever
+
+if TYPE_CHECKING:
+    from rag_local.chunker import Document
+    from rag_local.embedder import Embedder
+    from rag_local.generator import LLMGenerator
+    from rag_local.store import VectorStore
 
 log = get_logger(__name__)
 
@@ -71,19 +76,38 @@ class RagPipeline:
             print(f"  [{c.metadata.get('source')}] score={c.score:.2f}")
     """
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        embedder: Embedder | None = None,
+        store: VectorStore | None = None,
+        generator: LLMGenerator | None = None,
+    ) -> None:
+        """Build the pipeline; any component not passed in is created from settings.
+
+        The defaults are a sentence-transformers embedder, a persistent Chroma
+        store and an Ollama generator. Tests inject fakes instead.
+        """
         config = settings or Settings()
 
-        self._embedder = SentenceTransformerEmbedder(
-            model_name=config.embedding_model_name,
-            device=config.embedding_device,
-        )
+        if embedder is None:
+            from rag_local.embedder import SentenceTransformerEmbedder
 
-        self._store = ChromaVectorStore(
-            persist_dir=config.chroma_persist_dir,
-            collection_name=config.collection_name,
-            embedder=self._embedder,
-        )
+            embedder = SentenceTransformerEmbedder(
+                model_name=config.embedding_model_name,
+                device=config.embedding_device,
+            )
+        self._embedder = embedder
+
+        if store is None:
+            from rag_local.store import ChromaVectorStore
+
+            store = ChromaVectorStore(
+                persist_dir=config.chroma_persist_dir,
+                collection_name=config.collection_name,
+                embedder=embedder,
+            )
+        self._store = store
 
         self._retriever = Retriever(
             embedder=self._embedder,
@@ -92,9 +116,17 @@ class RagPipeline:
             min_relevance_score=config.min_relevance_score,
         )
 
-        self._generator = OllamaGenerator(config)
+        if generator is None:
+            from rag_local.generator import OllamaGenerator
+
+            generator = OllamaGenerator(config)
+        self._generator = generator
 
         self._config = config
+
+    def retrieve(self, question: str, top_k: int | None = None) -> list[RetrievedChunk]:
+        """Retrieve relevant chunks without generating an answer (used by the retrieval eval)."""
+        return self._retriever.retrieve(question, top_k=top_k or self._config.top_k)
 
     def query(self, question: str, top_k: int | None = None) -> RagResult:
         """Run the full RAG pipeline: retrieve → generate.
@@ -107,7 +139,8 @@ class RagPipeline:
             RagResult with answer, citations, and metadata.
 
         Raises:
-            NoRelevantDocuments: If no documents are relevant to the question.
+            NoRelevantDocumentsError: If no chunk passes the relevance threshold.
+            RagError: If retrieval fails for another reason.
             GenerationError: If the LLM fails.
         """
         if not question or not question.strip():
@@ -116,12 +149,12 @@ class RagPipeline:
         # Step 1: Retrieve
         try:
             chunks = self._retriever.retrieve(question, top_k=top_k or self._config.top_k)
-        except NoRelevantDocuments:
+        except NoRelevantDocumentsError:
             raise
         except Exception as exc:
             raise RagError(f"Retrieval failed: {exc}") from exc
 
-        confidence = max(c.score for c in chunks) if chunks else 0.0
+        confidence = max(c.score for c in chunks)
 
         # Step 2: Generate
         prompt = _build_rag_prompt(question, chunks)
@@ -150,10 +183,10 @@ class RagPipeline:
         )
 
     def ingest(self, documents: list[Document]) -> int:
-        """Ingest documents into the vector store.
+        """Chunk documents and upsert them into the vector store.
 
-        Args:
-            documents: List of Document objects to chunk and store.
+        Chunk IDs are ``<filename>#<chunk_id>``, so ingesting the same documents
+        again replaces their chunks instead of duplicating them.
 
         Returns:
             Number of chunks stored.
@@ -161,8 +194,6 @@ class RagPipeline:
         Raises:
             RagError: If ingestion fails.
         """
-        from rag_local.chunker import RecursiveCharacterChunker
-
         chunker = RecursiveCharacterChunker(
             chunk_size=self._config.chunk_size,
             chunk_overlap=self._config.chunk_overlap,
@@ -174,9 +205,13 @@ class RagPipeline:
 
         texts = [c.text for c in chunks]
         metadatas = [c.metadata for c in chunks]
+        ids = [
+            f"{c.metadata.get('filename') or Path(str(c.metadata.get('source', 'doc'))).name}#{c.chunk_id}"
+            for c in chunks
+        ]
 
         try:
-            self._store.add(texts=texts, metadatas=metadatas)
+            self._store.add(texts=texts, metadatas=metadatas, ids=ids)
         except Exception as exc:
             raise RagError(f"Failed to ingest documents: {exc}") from exc
 

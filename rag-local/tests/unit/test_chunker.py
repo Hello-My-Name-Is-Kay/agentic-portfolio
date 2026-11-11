@@ -25,10 +25,34 @@ class TestRecursiveCharacterChunker:
 
     def test_long_document_split_into_multiple_chunks(self) -> None:
         chunker = RecursiveCharacterChunker(chunk_size=50, chunk_overlap=10)
-        text = " ".join(["word"] * 100)  # ~600 chars
-        doc = Document(page_content=text, metadata={})
-        chunks = chunker.chunk([doc])
+        text = " ".join(["word"] * 100)  # 499 chars
+        chunks = chunker.chunk([Document(page_content=text, metadata={})])
         assert len(chunks) > 1
+        assert all(len(c.text) <= 50 for c in chunks)
+        assert [c.chunk_id for c in chunks] == list(range(len(chunks)))
+        # every word survives chunking
+        assert sum(c.text.split().count("word") for c in chunks) >= 100
+
+    def test_consecutive_chunks_overlap(self) -> None:
+        chunker = RecursiveCharacterChunker(chunk_size=40, chunk_overlap=10)
+        text = " ".join(f"w{i:02d}" for i in range(60))
+        chunks = chunker.chunk([Document(page_content=text)])
+        for a, b in zip(chunks, chunks[1:], strict=False):
+            assert a.text.split()[-1] in b.text.split()[:3]
+
+    def test_prefers_paragraph_boundary(self) -> None:
+        chunker = RecursiveCharacterChunker(chunk_size=60, chunk_overlap=0)
+        text = "First paragraph sentence one. Sentence two here.\n\nSecond paragraph text that is long enough."
+        chunks = chunker.chunk([Document(page_content=text)])
+        assert chunks[0].text == "First paragraph sentence one. Sentence two here."
+
+    def test_terminates_when_separator_is_inside_overlap(self) -> None:
+        # Regression: a separator near the start of the window used to stall the loop forever.
+        chunker = RecursiveCharacterChunker(chunk_size=20, chunk_overlap=15)
+        text = "ab " + "x" * 200
+        chunks = chunker.chunk([Document(page_content=text)])
+        assert "".join(c.text for c in chunks).count("x") >= 200
+        assert len(chunks) < 50
 
     def test_chunk_overlap_less_than_chunk_size(self) -> None:
         with pytest.raises(ValueError, match="chunk_overlap must be less than chunk_size"):
@@ -56,4 +80,4 @@ class TestRecursiveCharacterChunker:
         for c in chunks:
             assert c.metadata["source"] == "test.md"
             assert c.metadata["author"] == "me"
-            assert "doc_index" in c.metadata
+            assert c.metadata["doc_index"] == 0

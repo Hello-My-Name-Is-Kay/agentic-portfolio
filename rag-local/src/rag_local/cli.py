@@ -12,12 +12,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from rag_local.config import Settings
-from rag_local.errors import NoRelevantDocuments, RagError
+from rag_local.errors import NoRelevantDocumentsError, RagError
 from rag_local.loader import load_documents
 from rag_local.logging import configure_logging, get_logger
 from rag_local.pipeline import RagPipeline
@@ -25,7 +27,7 @@ from rag_local.pipeline import RagPipeline
 log = get_logger("rag.cli")
 
 
-def _add_ingest_parser(subparsers) -> None:
+def _add_ingest_parser(subparsers: Any) -> None:
     p = subparsers.add_parser("ingest", help="Load documents into the vector store")
     p.add_argument("--source", "-s", default="./docs", help="Directory containing policy markdown files")
     p.add_argument("--persist-dir", "-p", default=None, help="Vector store persist directory")
@@ -33,7 +35,7 @@ def _add_ingest_parser(subparsers) -> None:
     p.set_defaults(func=_cmd_ingest)
 
 
-def _add_query_parser(subparsers) -> None:
+def _add_query_parser(subparsers: Any) -> None:
     p = subparsers.add_parser("query", help="Ask a question against the policy documents")
     p.add_argument("question", nargs="?", help="Your question (omit for interactive mode)")
     p.add_argument("--top-k", type=int, default=None, help="Number of documents to retrieve")
@@ -42,9 +44,8 @@ def _add_query_parser(subparsers) -> None:
     p.set_defaults(func=_cmd_query)
 
 
-def _cmd_ingest(args) -> int:
+def _cmd_ingest(args: argparse.Namespace) -> int:
     """Handle the 'ingest' command."""
-    import json
     settings = Settings()
     if args.persist_dir:
         settings.chroma_persist_dir = args.persist_dir
@@ -62,28 +63,35 @@ def _cmd_ingest(args) -> int:
     log.info("cli.ingest.done", chunks=count, elapsed_s=round(elapsed, 1))
 
     if args.json:
-        print(json.dumps({
-            "status": "ok", "action": "ingest",
-            "chunks_ingested": count, "documents_loaded": len(docs),
-            "persist_dir": settings.chroma_persist_dir,
-            "elapsed_s": round(elapsed, 1),
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "action": "ingest",
+                    "chunks_ingested": count,
+                    "documents_loaded": len(docs),
+                    "persist_dir": settings.chroma_persist_dir,
+                    "elapsed_s": round(elapsed, 1),
+                },
+                indent=2,
+            )
+        )
     else:
         print(f"\n✓ Ingested {count} chunks from {len(docs)} documents into {settings.chroma_persist_dir}")
         print(f"  Elapsed: {elapsed:.1f}s")
     return 0
 
 
-def _cmd_query(args) -> int:
+def _cmd_query(args: argparse.Namespace) -> int:
     """Handle the 'query' command."""
+    if (args.interactive or not args.question) and args.json:
+        print(json.dumps({"status": "error", "reason": "--json requires a direct question, not interactive mode"}))
+        return 1
+
     settings = Settings()
     pipeline = RagPipeline(settings)
 
     if args.interactive or not args.question:
-        if args.json:
-            # Interactive mode not supported with --json; require a direct question
-            print(json.dumps({"status": "error", "reason": "--json requires a direct question, not interactive mode"}))
-            return 1
         print("RAG Policy Assistant — Interactive Mode")
         print("Type 'exit', 'quit', or Ctrl+C to stop.\n")
         while True:
@@ -102,8 +110,7 @@ def _cmd_query(args) -> int:
     return _run_query(pipeline, args.question, args.top_k, args.json)
 
 
-def _run_query(pipeline: RagPipeline, question: str, top_k: int | None,
-               json_output: bool = False) -> int:
+def _run_query(pipeline: RagPipeline, question: str, top_k: int | None, json_output: bool = False) -> int:
     """Run a single query and print the result.
 
     Args:
@@ -115,13 +122,19 @@ def _run_query(pipeline: RagPipeline, question: str, top_k: int | None,
     Returns:
         0 on success, 1 on error.
     """
-    import json
     try:
         result = pipeline.query(question, top_k=top_k)
-    except NoRelevantDocuments:
+    except NoRelevantDocumentsError:
         if json_output:
-            print(json.dumps({"status": "error", "code": "NO_RELEVANT_DOCS",
-                              "reason": "No documents scored above the relevance threshold."}))
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "code": "NO_RELEVANT_DOCS",
+                        "reason": "No documents scored above the relevance threshold.",
+                    }
+                )
+            )
         else:
             print("\nI don't know based on the available policies.")
             print("(No documents scored above the relevance threshold.)\n")
@@ -142,28 +155,35 @@ def _run_query(pipeline: RagPipeline, question: str, top_k: int | None,
         return 1
 
     if json_output:
-        print(json.dumps({
-            "status": "ok",
-            "question": question,
-            "answer": result.answer,
-            "confidence": result.confidence,
-            "model": result.model,
-            "latency_ms": result.latency_ms,
-            "tokens_in": result.tokens_in,
-            "tokens_out": result.tokens_out,
-            "citations": [
+        print(
+            json.dumps(
                 {
-                    "source": c.metadata.get("source", "unknown"),
-                    "filename": Path(c.metadata.get("source", "")).name,
-                    "score": round(c.score, 3),
-                }
-                for c in result.citations
-            ],
-        }, indent=2))
+                    "status": "ok",
+                    "question": question,
+                    "answer": result.answer,
+                    "confidence": result.confidence,
+                    "model": result.model,
+                    "latency_ms": result.latency_ms,
+                    "tokens_in": result.tokens_in,
+                    "tokens_out": result.tokens_out,
+                    "citations": [
+                        {
+                            "source": c.metadata.get("source", "unknown"),
+                            "filename": Path(c.metadata.get("source", "")).name,
+                            "score": round(c.score, 3),
+                        }
+                        for c in result.citations
+                    ],
+                },
+                indent=2,
+            )
+        )
     else:
         print(f"\n{result.answer}\n")
-        print(f"[confidence: {result.confidence:.3f} | model: {result.model} | "
-              f"latency: {result.latency_ms:.0f}ms | tokens: {result.tokens_in}→{result.tokens_out}]")
+        print(
+            f"[confidence: {result.confidence:.3f} | model: {result.model} | "
+            f"latency: {result.latency_ms:.0f}ms | tokens: {result.tokens_in}→{result.tokens_out}]"
+        )
 
         if result.citations:
             print("\nSources:")
@@ -175,6 +195,7 @@ def _run_query(pipeline: RagPipeline, question: str, top_k: int | None,
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse arguments and run the chosen command."""
     configure_logging(log_level="INFO")
 
     parser = argparse.ArgumentParser(
@@ -185,7 +206,8 @@ def main(argv: list[str] | None = None) -> int:
     _add_query_parser(subparsers)
 
     args = parser.parse_args(argv)
-    return args.func(args)
+    result: int = args.func(args)
+    return result
 
 
 if __name__ == "__main__":

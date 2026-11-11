@@ -2,100 +2,84 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
-from rag_local.errors import NoRelevantDocuments, RetrievalError
+from rag_local.errors import NoRelevantDocumentsError, RetrievalError
 from rag_local.retriever import Retriever
 
-
-class FakeEmbedder:
-    """A fake embedder that returns a fixed-dimension vector."""
-
-    def __init__(self, dim: int = 384) -> None:
-        self._dim = dim
-
-    @property
-    def dimension(self) -> int:
-        return self._dim
-
-    def embed(self, text: str) -> list[float]:
-        return [0.1] * self._dim
-
-    def embed_many(self, texts: list[str]) -> list[list[float]]:
-        return [[0.1] * self._dim for _ in texts]
+from .fakes import HashEmbedder
 
 
 class FakeStore:
-    """A fake vector store with controllable results."""
+    """A vector store returning canned results."""
 
-    def __init__(self) -> None:
-        self._results: list[dict] = []
-        self._count = 0
-
-    def seed(self, results: list[dict]) -> None:
-        self._results = results
-        self._count = len(results)
+    def __init__(self, results: list[dict[str, Any]] | None = None, fail: bool = False) -> None:
+        self._results = results or []
+        self._fail = fail
 
     @property
     def count(self) -> int:
-        return self._count
+        return len(self._results)
 
-    def add(self, texts: list[str], embeddings: list[list[float]] | None = None, metadatas: list[dict] | None = None) -> None:
-        self._count += len(texts)
+    def add(self, texts: list[str], embeddings: Any = None, metadatas: Any = None, ids: Any = None) -> None:
+        raise NotImplementedError
 
-    def search(self, query_embedding: list[float], top_k: int = 5) -> list[dict]:
+    def search(self, query_embedding: list[float], top_k: int = 5) -> list[dict[str, Any]]:  # noqa: ARG002
+        if self._fail:
+            raise RuntimeError("index offline")
         return self._results[:top_k]
 
 
+def _result(source: str, distance: float) -> dict[str, Any]:
+    return {"id": source, "document": f"{source} content", "metadata": {"source": source}, "distance": distance}
+
+
 class TestRetriever:
-    """Tests for the Retriever class."""
+    def test_scores_are_cosine_similarity_sorted_and_filtered(self) -> None:
+        store = FakeStore([_result("insurance.md", 0.4), _result("fuel.md", 0.2), _result("other.md", 0.7)])
+        chunks = Retriever(HashEmbedder(), store, min_relevance_score=0.5).retrieve("fuel?")
+        assert [c.metadata["source"] for c in chunks] == ["fuel.md", "insurance.md"]
+        assert [c.score for c in chunks] == pytest.approx([0.8, 0.6])
+        assert "fuel.md" in repr(chunks[0])
 
-    def test_retrieve_returns_chunks(self) -> None:
-        embedder = FakeEmbedder()
-        store = FakeStore()
-        store.seed([
-            {"id": "1", "document": "Fuel policy content.", "metadata": {"source": "fuel.md"}, "distance": 0.2},
-            {"id": "2", "document": "Insurance policy content.", "metadata": {"source": "insurance.md"}, "distance": 0.3},
-        ])
+    def test_top_k_override(self) -> None:
+        store = FakeStore([_result("a.md", 0.1), _result("b.md", 0.2), _result("c.md", 0.3)])
+        retriever = Retriever(HashEmbedder(), store, top_k=3, min_relevance_score=0.0)
+        assert len(retriever.retrieve("q", top_k=1)) == 1
+        assert len(retriever.retrieve("q")) == 3
 
-        retriever = Retriever(embedder, store, min_relevance_score=0.5)
-        chunks = retriever.retrieve("What is the fuel policy?")
-        assert len(chunks) == 2
-        assert chunks[0].score >= 0.5  # distance 0.2 → score 0.8
+    def test_no_relevant_docs_raises_with_best_score(self) -> None:
+        store = FakeStore([_result("other.md", 0.9)])
+        with pytest.raises(NoRelevantDocumentsError, match=r"Best score: 0\.100"):
+            Retriever(HashEmbedder(), store, min_relevance_score=0.5).retrieve("What is the fuel policy?")
 
-    def test_no_relevant_docs_raises(self) -> None:
-        embedder = FakeEmbedder()
-        store = FakeStore()
-        store.seed([
-            {"id": "1", "document": "Irrelevant content.", "metadata": {"source": "other.md"}, "distance": 0.9},
-        ])
-
-        retriever = Retriever(embedder, store, min_relevance_score=0.5)
-        with pytest.raises(NoRelevantDocuments):
-            retriever.retrieve("What is the fuel policy?")
+    def test_empty_store_raises(self) -> None:
+        with pytest.raises(NoRelevantDocumentsError, match="No documents found"):
+            Retriever(HashEmbedder(), FakeStore(), min_relevance_score=0.0).retrieve("anything")
 
     def test_empty_query_raises(self) -> None:
-        embedder = FakeEmbedder()
-        store = FakeStore()
-        retriever = Retriever(embedder, store)
         with pytest.raises(RetrievalError, match="empty query"):
-            retriever.retrieve("")
+            Retriever(HashEmbedder(), FakeStore()).retrieve("")
+
+    def test_store_failure_wrapped(self) -> None:
+        with pytest.raises(RetrievalError, match="index offline"):
+            Retriever(HashEmbedder(), FakeStore(fail=True)).retrieve("q")
+
+    def test_embed_failure_wrapped(self) -> None:
+        class Broken(HashEmbedder):
+            def embed(self, _text: str) -> list[float]:
+                raise RuntimeError("model gone")
+
+        with pytest.raises(RetrievalError, match="model gone"):
+            Retriever(Broken(), FakeStore()).retrieve("q")
 
     def test_top_k_must_be_positive(self) -> None:
         with pytest.raises(ValueError, match="top_k must be >= 1"):
-            Retriever(FakeEmbedder(), FakeStore(), top_k=0)
+            Retriever(HashEmbedder(), FakeStore(), top_k=0)
 
-    def test_min_score_out_of_range_raises(self) -> None:
-        with pytest.raises(ValueError):
-            Retriever(FakeEmbedder(), FakeStore(), min_relevance_score=-0.1)
-        with pytest.raises(ValueError):
-            Retriever(FakeEmbedder(), FakeStore(), min_relevance_score=1.5)
-
-    def test_empty_store_no_results(self) -> None:
-        embedder = FakeEmbedder()
-        store = FakeStore()
-        store.seed([])
-
-        retriever = Retriever(embedder, store, min_relevance_score=0.0)
-        with pytest.raises(NoRelevantDocuments):
-            retriever.retrieve("anything")
+    @pytest.mark.parametrize("score", [-0.1, 1.5])
+    def test_min_score_out_of_range_raises(self, score: float) -> None:
+        with pytest.raises(ValueError, match="between 0 and 1"):
+            Retriever(HashEmbedder(), FakeStore(), min_relevance_score=score)

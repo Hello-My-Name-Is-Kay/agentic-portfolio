@@ -35,7 +35,7 @@ class StoreError(RagError):
     """Vector store operation failure."""
 
 
-class NoRelevantDocuments(RetrievalError):
+class NoRelevantDocumentsError(RetrievalError):
     """Retrieval returned no documents above the relevance threshold."""
 
 
