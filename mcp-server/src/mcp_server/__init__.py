@@ -1,11 +1,8 @@
-"""MCP Server — Portfolio Project
+"""MCP server exposing the mock booking API as three agent tools.
 
-An MCP server that exposes rental-booking tools for LLM agents.
-Wraps the Mock Booking API into three tools with typed inputs,
-precise docstrings, and structured error JSON (never raises).
-
-Demonstrates: MCP tool design, typed input schemas, error resilience,
-and the tool-as-a-service pattern for agentic systems.
+Typed, validated tool inputs; every booking-API outcome is returned to the
+agent as a JSON string with ``status`` and, on failure, a machine-readable
+``code``.
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 # MCP Server
 
-> **TL;DR** — MCP (Model Context Protocol) server with 3 tools (`get_reservation`, `change_reservation`, `cancel_reservation`). Typed Pydantic input schemas, precise LLM-oriented docstrings on every tool, structured error JSON (never raises), idempotency key on write tools, demo script showing LLM agent calling each tool. Wraps the Mock Booking API.
+> **TL;DR** — MCP (Model Context Protocol) server, built on the official Python SDK (`mcp` 2.x `MCPServer`), with 3 tools (`get_reservation`, `change_reservation`, `cancel_reservation`). Validated input schemas (e.g. `R-#####` IDs), LLM-oriented tool descriptions, every booking-API outcome returned as structured JSON, idempotency keys on write tools, and a demo that drives the server over stdio with the MCP client. Wraps the [Mock Booking API](../mock-booking-api).
 
 > **Tags:** `mcp`, `tool-design`, `structured-errors`, `idempotency`, `pydantic-schemas`, `llm-docstrings`, `stdio-transport`
 
@@ -8,7 +8,7 @@ Model Context Protocol server exposing rental-booking tools for LLM agents.
 
 ## Why This Exists
 
-This project demonstrates MCP tool design — a skill explicitly called out in the job posting. The server wraps the Mock Booking API into three tools with typed inputs, precise docstrings (which are the LLM's only instructions), and structured error JSON that never raises. It proves competence with the tool-as-a-service pattern for agentic systems.
+An agent is only as safe as its tools. This server wraps the booking API in three tools whose schemas and descriptions are the model's only instructions: inputs are validated before any request is made, write tools require an idempotency key so retries cannot double-apply, descriptions tell the model to confirm destructive actions, and every failure comes back as a code the agent can act on instead of an exception.
 
 ## Architecture
 
@@ -49,54 +49,34 @@ pip install -e ".[dev]"
 ### Run Server
 
 ```bash
-python -m mcp_server.server
+BOOKING_API_BASE=http://localhost:8000 python -m mcp_server.server
 ```
 
-The server runs over stdio transport, suitable for MCP clients.
+The server speaks MCP over stdio, so an MCP host (Claude Desktop, Claude Code, an agent framework) launches it as a subprocess. Logs go to stderr; stdout carries only JSON-RPC.
 
 ## Output Format
 
-The MCP server communicates over stdio using **JSON-RPC** messages — every tool response is a JSON string. When using the demo script directly:
-
-| Mode | Flag | Consumer |
-|------|------|----------|
-| **Human-readable** | *(default)* | Terminal — formatted demo flow |
-| **JSON** | `--json` | LLMs, scripts — structured tool results |
-
-### JSON Output Schema (`scripts/demo_mcp.py --json`)
-
-```json
-{
-  "tools": [
-    {
-      "name": "get_reservation",
-      "result": {
-        "status": "ok",
-        "data": { ... }
-      }
-    },
-    {
-      "name": "get_reservation_not_found",
-      "result": {
-        "status": "error",
-        "code": "NOT_FOUND",
-        "reason": "No reservation 'R-99999' found."
-      }
-    }
-  ]
-}
-```
-
-When called by an LLM host (e.g. Claude Desktop), each tool returns a JSON string per the MCP spec — always `{"status": "ok|error", ...}`.
+Each tool returns one text content block holding a JSON string: `{"status": "ok", "data": {...}}` or `{"status": "error", "code": "...", "reason": "..."}`.
 
 ### Run Demo
 
-```bash
-# Human-readable
-python scripts/demo_mcp.py
+`scripts/demo_mcp.py` starts the server as a subprocess, connects with the MCP client over stdio, lists the tools and calls them against a running booking API:
 
-# JSON output (for LLM consumption)
-python scripts/demo_mcp.py --json
+```bash
+python scripts/demo_mcp.py          # human-readable
+python scripts/demo_mcp.py --json   # full results as JSON
+```
+
+Against a fresh booking API it prints:
+
+```
+Tools: get_reservation, change_reservation, cancel_reservation
+
+get_reservation(R-99999) -> error NOT_FOUND
+get_reservation(R-00001) -> ok active
+change_reservation(R-00001) -> ok active
+cancel_reservation(R-00001) -> ok cancelled
+cancel_reservation(R-00001) -> error INVALID_STATE
 ```
 
 ## Tool Documentation
@@ -107,7 +87,7 @@ Look up one reservation by ID.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `reservation_id` | string | Reservation ID, format `R-#####` |
+| `reservation_id` | string | Reservation ID, must match `R-#####` |
 
 Returns reservation details including dates, status, and vehicle category. Returns `NOT_FOUND` error if the ID doesn't exist.
 
@@ -118,10 +98,10 @@ Change the drop-off date of an existing reservation.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `reservation_id` | string | Reservation ID, format `R-#####` |
-| `new_dropoff_date` | string | ISO 8601 date, e.g. `2025-11-14` |
+| `new_dropoff_date` | string | ISO date `YYYY-MM-DD`, e.g. `2025-11-14` |
 | `idempotency_key` | string | Caller-generated UUID; reuse on retry |
 
-Uses the idempotency key to prevent duplicate processing. Returns `INVALID_STATE` if the reservation is already cancelled.
+The booking API replays the stored result for a repeated key. Returns `INVALID_STATE` if the reservation is cancelled, `BAD_INPUT` if the date is not after pickup.
 
 ### `cancel_reservation`
 
@@ -130,20 +110,20 @@ Cancel a reservation.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `reservation_id` | string | Reservation ID, format `R-#####` |
-| `reason` | string | Optional reason for cancellation |
 | `idempotency_key` | string | Caller-generated UUID; reuse on retry |
+| `reason` | string | Optional reason for cancellation |
 
 Returns `INVALID_STATE` if the reservation is already cancelled.
 
 ## Error Handling
 
-Every tool returns a structured JSON string — never raises.
+Arguments that fail the schema (e.g. `reservation_id="../admin"`, a non-ISO date, a missing idempotency key) are rejected by the MCP SDK with a tool error before any HTTP request is made. Once a tool runs, every outcome, including timeouts and connection failures, is a structured JSON string:
 
 ```json
 {"status": "error", "code": "NOT_FOUND", "reason": "No reservation 'R-99999' found."}
 ```
 
-Error codes: `NOT_FOUND`, `INVALID_STATE`, `UPSTREAM_UNAVAILABLE`, `INTERNAL`.
+Error codes: `NOT_FOUND`, `INVALID_STATE`, `IDEMPOTENCY_CONFLICT`, `BAD_INPUT`, `AUTH_FAILED`, `UPSTREAM_UNAVAILABLE`, `INTERNAL`.
 
 ## Testing
 
@@ -151,7 +131,9 @@ Error codes: `NOT_FOUND`, `INVALID_STATE`, `UPSTREAM_UNAVAILABLE`, `INTERNAL`.
 pytest --cov=src --cov-fail-under=80
 ```
 
-## Intentional Omissions
+Tests call the tools through `MCPServer.list_tools()` / `call_tool()` as a client would, with the booking API simulated by `httpx.MockTransport` (no network): request method, path, headers and body; mapping of every API error; timeouts and connection errors; schema rejection of bad arguments before any request.
+
+## Not built yet
 
 - No remote hosting (MCP runs over stdio for local agent integration).
 - No OAuth (API key forwarded to booking API).
@@ -160,18 +142,4 @@ pytest --cov=src --cov-fail-under=80
 ## Related Repos
 
 - [mock-booking-api](../mock-booking-api) — The REST API this MCP server wraps.
-- [flagship-agent](../flagship-agent) — LangGraph agent that uses these tools.
-
-## Definition of Done Checklist
-
-- [x] All public functions have type hints; `mypy --strict src` passes.
-- [x] `ruff check .` and `ruff format --check .` pass.
-- [x] 3 tools with precise docstrings (designed for LLM consumption).
-- [x] Typed input schemas via Pydantic.
-- [x] Never raise: every tool returns structured error JSON.
-- [x] Every write tool accepts idempotency key.
-- [x] Demo script shows LLM calling tools.
-- [x] Tests: each tool returns error JSON on injected failure.
-- [x] `pytest --cov=src --cov-fail-under=80` passes.
-- [x] CHANGELOG.md has an entry.
-- [x] No secrets, no print, no commented-out code, no TODO.
+- [flagship-agent](../flagship-agent) — agent that calls the same booking API.

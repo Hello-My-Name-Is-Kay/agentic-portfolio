@@ -1,90 +1,62 @@
-"""Demo script: shows an LLM calling the MCP tools.
+"""Demo: talk to the MCP server the way an agent host does.
 
-This script simulates how an LLM agent would interact with the
-MCP server's tools — calling each one and displaying the results.
+Starts ``python -m mcp_server.server`` as a subprocess, connects over stdio
+with the MCP client, lists the tools and calls each one against the booking
+API at BOOKING_API_BASE (start mock-booking-api first).
 
 Usage:
-    python scripts/demo_mcp.py
+    python scripts/demo_mcp.py          # human-readable
+    python scripts/demo_mcp.py --json   # one JSON document
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
-from pathlib import Path
+import uuid
+from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from mcp import ClientSession, StdioServerParameters, stdio_client
+
+CALLS: list[tuple[str, dict[str, Any]]] = [
+    ("get_reservation", {"reservation_id": "R-99999"}),
+    ("get_reservation", {"reservation_id": "R-00001"}),
+    ("change_reservation", {"reservation_id": "R-00001", "new_dropoff_date": "2025-11-14"}),
+    ("cancel_reservation", {"reservation_id": "R-00001", "reason": "Demo cancellation"}),
+    ("cancel_reservation", {"reservation_id": "R-00001", "reason": "Trying again"}),
+]
 
 
-async def demo() -> None:
-    """Demonstrate all 3 MCP tools."""
-    print("=" * 60)
-    print("  MCP Server Demo")
-    print("  Using the booking tools as an LLM agent would.")
-    print("=" * 60)
+async def run() -> dict[str, Any]:
+    """Run the scripted calls and return tool names plus each call's decoded result."""
+    params = StdioServerParameters(command=sys.executable, args=["-m", "mcp_server.server"], env=dict(os.environ))
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+        await session.initialize()
+        tools = [t.name for t in (await session.list_tools()).tools]
+        calls = []
+        for name, args in CALLS:
+            if name != "get_reservation":
+                args = {**args, "idempotency_key": str(uuid.uuid4())}
+            result = await session.call_tool(name, args)
+            text = result.content[0].text if result.content else ""  # type: ignore[union-attr]
+            calls.append({"tool": name, "arguments": args, "result": json.loads(text)})
+        return {"tools": tools, "calls": calls}
 
-    # Import tool implementations directly
-    from mcp_server.server import _get_reservation, _change_reservation, _cancel_reservation
 
-    print("\n\n--- 1. Get Reservation (not found example) ---")
-    result = await _get_reservation("R-99999")
-    data = json.loads(result)
-    print(f"  Status: {data['status']}")
-    print(f"  Code: {data.get('code', 'N/A')}")
-    print(f"  Reason: {data.get('reason', 'N/A')}")
-
-    print("\n\n--- 2. Get Reservation (success) ---")
-    result = await _get_reservation("R-00001")
-    data = json.loads(result)
-    print(f"  Status: {data.get('status', 'N/A')}")
-    if data.get("data"):
-        print(f"  Reservation: {json.dumps(data['data'], indent=4)}")
-
-    print("\n\n--- 3. Change Reservation (idempotent) ---")
-    result = await _change_reservation("R-00001", "2025-11-14", "demo-change-001")
-    data = json.loads(result)
-    print(f"  Status: {data['status']}")
-    if data.get("code"):
-        print(f"  Code: {data['code']}")
-        print(f"  Reason: {data.get('reason', 'N/A')}")
-
-    print("\n\n--- 4. Cancel Reservation (idempotent) ---")
-    result = await _cancel_reservation("R-00001", "Demo cancellation", "demo-cancel-001")
-    data = json.loads(result)
-    print(f"  Status: {data['status']}")
-    if data.get("code"):
-        print(f"  Code: {data['code']}")
-        print(f"  Reason: {data.get('reason', 'N/A')}")
-
-    print("\n\n--- 5. Cancel Already Cancelled ---")
-    result = await _cancel_reservation("R-00001", "Trying again", "demo-cancel-002")
-    data = json.loads(result)
-    print(f"  Status: {data['status']}")
-    print(f"  Code: {data.get('code', 'N/A')}")
-    print(f"  Reason: {data.get('reason', 'N/A')}")
-
-    print("\n" + "=" * 60)
-    print("  Demo complete.")
-    print("  All tools return structured JSON — never raise.")
-    print("=" * 60)
+def main() -> None:
+    """Print the demo results."""
+    report = asyncio.run(run())
+    if "--json" in sys.argv:
+        print(json.dumps(report, indent=2))
+        return
+    print(f"Tools: {', '.join(report['tools'])}\n")
+    for call in report["calls"]:
+        result = call["result"]
+        summary = result.get("code") or result.get("data", {}).get("status", "")
+        print(f"{call['tool']}({call['arguments'].get('reservation_id')}) -> {result['status']} {summary}")
 
 
 if __name__ == "__main__":
-    import sys
-    if "--json" in sys.argv:
-        # JSON mode: run all tools and print structured results
-        import json as json_mod
-
-        async def json_demo() -> None:
-            from mcp_server.server import _get_reservation
-            results = {
-                "tools": [
-                    {"name": "get_reservation", "result": json.loads(await _get_reservation("R-00001"))},
-                    {"name": "get_reservation_not_found", "result": json.loads(await _get_reservation("R-99999"))},
-                ]
-            }
-            print(json_mod.dumps(results, indent=2))
-        asyncio.run(json_demo())
-    else:
-        asyncio.run(demo())
+    main()

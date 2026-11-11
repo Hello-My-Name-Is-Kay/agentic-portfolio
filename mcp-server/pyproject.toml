@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 license = {text = "MIT"}
 
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=2.3,<3",
     "httpx>=0.28.0",
     "pydantic>=2.0.0",
     "structlog>=24.0.0",
@@ -29,6 +29,12 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "B", "ARG", "C4", "D", "SIM", "TCH", "UP"]
 
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+
 [tool.mypy]
 strict = true
 python_version = "3.11"
@@ -39,4 +45,5 @@ disallow_any_unimported = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 addopts = "--cov=src --cov-report=term-missing --cov-fail-under=80"
