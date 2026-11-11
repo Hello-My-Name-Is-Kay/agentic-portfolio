@@ -1,12 +1,8 @@
-# Mock Booking API — Portfolio Project
-#
-# A small FastAPI service for a fictional car rental company.
-# Provides CRUD endpoints for reservations with Pydantic models,
-# auto-generated OpenAPI spec, API key auth, and idempotency.
-#
-# Demonstrates: FastAPI patterns, Pydantic validation at boundaries,
-# idempotency-Key header support, SQLite persistence, and
-# comprehensive error handling with structured error responses.
+"""Mock booking API: a small FastAPI service for a fictional car rental company.
+
+Customer lookup and reservation get/change/cancel endpoints with Pydantic
+validation, SQLite persistence, an optional API key, Idempotency-Key support
+on writes, and a flat JSON error envelope.
 """
 
 from __future__ import annotations

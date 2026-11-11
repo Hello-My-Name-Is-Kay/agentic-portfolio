@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import uuid
-from datetime import date, datetime
+from datetime import UTC, date, datetime
+from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 
 class Customer(BaseModel):
@@ -36,7 +36,8 @@ class Location(BaseModel):
 
 
 class ReservationStatus(str):
-    """Reservation status enum."""
+    """Reservation status values."""
+
     ACTIVE = "active"
     CANCELLED = "cancelled"
     COMPLETED = "completed"
@@ -55,7 +56,8 @@ class ReservationCreate(BaseModel):
 
     @field_validator("return_date")
     @classmethod
-    def return_after_pickup(cls, v: date, info) -> date:  # type: ignore[no-untyped-def]
+    def return_after_pickup(cls, v: date, info: ValidationInfo) -> date:
+        """Reject a return date on or before the pickup date."""
         pickup = info.data.get("pickup_date")
         if pickup and v <= pickup:
             raise ValueError("return_date must be after pickup_date")
@@ -81,8 +83,8 @@ class Reservation(BaseModel):
     return_date: date
     vehicle_category: str
     status: str = Field(default="active", pattern=r"^(active|cancelled|completed|no_show)$")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class ChangeReservationRequest(BaseModel):
@@ -102,6 +104,6 @@ class ApiResponse(BaseModel):
     """Standard API response wrapper."""
 
     status: str = Field(pattern=r"^(ok|error)$")
-    data: dict | None = None
+    data: dict[str, Any] | None = None
     error: str | None = None
     error_code: str | None = None

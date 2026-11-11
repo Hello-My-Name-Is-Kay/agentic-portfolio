@@ -1,6 +1,6 @@
 # Mock Booking API
 
-> **TL;DR** — FastAPI service with 4 reservation endpoints (lookup, get, change, cancel). Pydantic v2 request/response models, auto-generated OpenAPI spec at `/openapi.json`, SQLite persistence with WAL mode, API key auth via `X-API-Key` header, `Idempotency-Key` header on write endpoints, structured JSON error responses. Seeded with 2 customers and 1 reservation.
+> **TL;DR** — FastAPI service with 4 endpoints (customer lookup, get/change/cancel reservation). Pydantic v2 request/response models, auto-generated OpenAPI spec at `/openapi.json`, SQLite persistence, optional API key via `X-API-Key`, `Idempotency-Key` on write endpoints (replays the stored response; a reused key for a different request gets 409), and one flat JSON error envelope for every error. Seeded with 2 customers and reservation `R-00001`.
 
 > **Tags:** `fastapi`, `openapi`, `pydantic`, `sqlite`, `idempotency`, `api-key-auth`, `structured-errors`, `mock-service`
 
@@ -8,7 +8,7 @@ A mock car rental reservation API with OpenAPI spec, idempotent writes, and API 
 
 ## Why This Exists
 
-This is the data layer that the flagship LangGraph agent calls. It demonstrates tool federation from OpenAPI, gives the agent real "write access" to exercise guardrails, and proves competence with FastAPI, Pydantic validation, idempotency, and structured error handling.
+This is the system of record that the [flagship agent](../flagship-agent) and the [MCP server](../mcp-server) call. It gives an agent real write operations (change, cancel) to exercise, with the properties a production booking API would need for safe agent use: input validation, an API key, idempotent retries, and machine-readable errors.
 
 ## Architecture
 
@@ -23,7 +23,7 @@ This is the data layer that the flagship LangGraph agent calls. It demonstrates 
                                │
                     ┌──────────▼──────────┐
                     │   BookingStore       │
-                    │   (SQLite + WAL)     │
+                    │   (SQLite)           │
                     └─────────────────────┘
                     ┌─────────────────────┐
                     │  Idempotency Store   │
@@ -97,7 +97,18 @@ This API natively speaks JSON — every endpoint returns structured JSON respons
 }
 ```
 
-All error codes: `NOT_FOUND`, `INVALID_STATE`, `BAD_INPUT`, `INTERNAL`, `AUTH_FAILED`.
+| Code | HTTP | When |
+|------|------|------|
+| `NOT_FOUND` | 404 | Unknown customer or reservation |
+| `BAD_INPUT` | 422 | Request body fails validation, or the new drop-off date is not after pickup |
+| `INVALID_STATE` | 409 | Changing or cancelling a cancelled reservation |
+| `IDEMPOTENCY_CONFLICT` | 409 | `Idempotency-Key` already used for a different request |
+| `AUTH_FAILED` | 401 | API key configured and missing/wrong |
+| `INTERNAL` | 500 | Unhandled error (no traceback is returned) |
+
+### Idempotency
+
+`PUT /change` and `POST /cancel` accept an `Idempotency-Key` header. The first response is stored for 24 hours together with a hash of the request (action, reservation ID, body). Repeating the same request with the same key returns the stored response without applying the change again; using the key for a different request returns `IDEMPOTENCY_CONFLICT`.
 
 ### With API Key
 
@@ -116,12 +127,15 @@ pytest --cov=src --cov-fail-under=80
 
 ### What the Tests Cover
 
-- Customer lookup: existing, nonexistent, invalid ID.
-- Get reservation: existing, nonexistent.
-- Change reservation: not found, invalid input validation.
-- Cancel reservation: not found, with reason.
-- Health check: returns ok.
-- API key auth: behavior when configured and unconfigured.
+Each test starts the app with a fresh in-memory database.
+
+- Customer lookup and get reservation: found, not found.
+- Change: success (persisted), not found, invalid date, drop-off before pickup, cancelled reservation.
+- Cancel: success, twice (409), not found.
+- Idempotency: replay returns the stored response and does not re-apply; reused key for a different request conflicts; records expire.
+- API key: open when unset; missing, wrong and correct key when set.
+- Error envelope for validation errors, a missing store, and unhandled exceptions; OpenAPI lists the endpoints.
+- Store: sequential IDs, partial updates, persistence to a file.
 
 ## Endpoints
 
@@ -134,28 +148,15 @@ pytest --cov=src --cov-fail-under=80
 | GET | `/health` | Health check | ✓ (read) |
 | GET | `/openapi.json` | OpenAPI specification | ✓ (read) |
 
-## Intentional Omissions
+## Not built yet
 
 - No real authentication (API key is a simple header check, not OAuth).
 - No payment processing (mock API by design).
-- No complex SQL (simple SQLite for quick setup).
-- No migration framework (SQLite schema created on startup).
+- No create-reservation endpoint (reservations are seeded or created through `BookingStore`).
+- No migration framework (the SQLite schema is created on startup; delete `booking.db` after schema changes).
+- No per-customer authorization: any valid API key can change any reservation.
 
 ## Related Repos
 
 - [mcp-server](../mcp-server) — MCP server wrapping this API.
-- [flagship-agent](../flagship-agent) — LangGraph agent that calls this API.
-
-## Definition of Done Checklist
-
-- [x] All public functions have type hints; `mypy --strict src` passes.
-- [x] `ruff check .` and `ruff format --check .` pass.
-- [x] Pydantic models at all boundaries (request/response).
-- [x] Idempotency-Key on change and cancel endpoints.
-- [x] Structured error responses (never raw tracebacks).
-- [x] API key check as FastAPI dependency.
-- [x] Auto-generated OpenAPI at `/openapi.json`.
-- [x] Tests for happy path, not found, invalid input, idempotent replay.
-- [x] `pytest --cov=src --cov-fail-under=80` passes.
-- [x] CHANGELOG.md has an entry.
-- [x] No secrets, no print, no commented-out code, no TODO.
+- [flagship-agent](../flagship-agent) — agent that calls this API as tools.

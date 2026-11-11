@@ -15,7 +15,7 @@ class ValidationError(BookingError):
     """Input validation failure."""
 
 
-class IdempotencyConflict(BookingError):
+class IdempotencyConflictError(BookingError):
     """Idempotency key conflict detected."""
 
 
