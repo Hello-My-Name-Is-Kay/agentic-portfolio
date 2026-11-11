@@ -64,8 +64,8 @@ from agent import CustomerServiceAgent, last_reply, trajectory
 agent = CustomerServiceAgent()
 await agent.run("C-00001 1234", thread_id="chat-42")
 state = await agent.run("Check reservation R-00001", thread_id="chat-42")
-print(last_reply(state))   # Reservation R-00001: Standard, pickup …
-print(trajectory(state))   # ['authenticate', 'lookup_reservation']
+print(last_reply(state))  # Reservation R-00001: Standard, pickup …
+print(trajectory(state))  # ['authenticate', 'lookup_reservation']
 ```
 
 ## Tests
