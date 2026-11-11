@@ -1,0 +1,24 @@
+name: guardrails
+on:
+  push:
+    paths: ["guardrails/**", ".github/workflows/guardrails.yml"]
+  pull_request:
+    paths: ["guardrails/**", ".github/workflows/guardrails.yml"]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: guardrails
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy --strict src
+      - run: pytest
+      - run: pip-audit
+      - name: Guardrail eval gate
+        run: python scripts/eval_guardrails.py --min-pass-rate 0.80

@@ -7,31 +7,28 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from guardrails.logging import configure_logging, get_logger
-from guardrails.suite import GuardrailSuite
+from guardrails.suite import DEFAULT_DATASET, GuardrailSuite
 
 log = get_logger("eval.guardrails")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Run the suite; return 1 if the pass rate is below --min-pass-rate."""
     configure_logging(log_level="INFO")
 
     parser = argparse.ArgumentParser(description="Run guardrail evaluation suite")
-    parser.add_argument("--dataset", default="tests/fixtures/attack_dataset.jsonl", help="Attack dataset path")
+    parser.add_argument("--dataset", default=str(DEFAULT_DATASET), help="Attack dataset path")
     parser.add_argument("--report", default="guardrail-report.json", help="Output report path")
     parser.add_argument("--min-pass-rate", type=float, default=0.8, help="Minimum acceptable pass rate")
     parser.add_argument("--json", action="store_true", help="Emit report to stdout as JSON for LLM consumption")
-    args = parser.parse_args()
-
-    import json
+    args = parser.parse_args(argv)
 
     suite = GuardrailSuite()
-    results = suite.run_all(dataset_path=args.dataset)
+    suite.run_all(dataset_path=args.dataset)
     report = suite.generate_report(output_path=args.report)
 
     if args.json:

@@ -1,165 +1,82 @@
 # Guardrails and Red-Team Suite
 
-> **TL;DR** — 33 red-team attack cases across 5 categories (prompt injection, PII leakage, output validation, boundary testing, authorization). Regex-based PII redactor covering 7 types (email, phone, SSN, credit card, driver's license, IP, API key). Pydantic output validator with schema, citation, and content-policy checks. Pass/fail report with per-category breakdown. CI gate at 80% pass rate.
+> **TL;DR** — Offline guardrail components for an LLM pipeline (regex PII redaction for 7 identifier types, a pattern-based prompt-injection detector, a Pydantic output validator) and a 36-case attack dataset that checks them, with a per-category pass/fail report and a CI gate.
 
-> **Tags:** `guardrails`, `red-team`, `prompt-injection`, `pii-redaction`, `output-validation`, `attack-dataset`, `security`, `ci-gate`
-
-A systematic red-team evaluation suite for LLM pipelines: prompt injection tests, PII redaction, output validation, and pass/fail reporting.
+> **Tags:** `guardrails`, `red-team`, `prompt-injection`, `pii-redaction`, `output-validation`, `attack-dataset`, `ci-gate`
 
 ## Why This Exists
 
-Security is a stated differentiator in the job posting, and this repo proves competence with it. It demonstrates a security-first mindset: 33 attack cases across 5 categories, a PII redaction pipeline, structured output validation, and a CI gate that blocks merges on regressions. No other candidate for this role can credibly claim NIS2/VAPT/Kali experience *and* demonstrate it in code.
+Before an LLM feature ships, its input and output filters should be tested against known attack phrasings the same way code is tested against known bugs. This repo keeps the attacks in a checked-in JSONL file, runs them through the guardrails, and fails CI if the pass rate drops.
 
-## Architecture
+## What it is, and what it is not
 
-```
-                    ┌──────────────────────────────────────┐
-                    │        Attack Dataset (33 cases)      │
-                    │  • prompt_injection (10)              │
-                    │  • pii_leakage (10)                   │
-                    │  • output_validation (5)              │
-                    │  • boundary_testing (5)               │
-                    │  • authorization (3)                  │
-                    └──────────────────┬───────────────────┘
-                                       │
-                                       ▼
-                    ┌──────────────────────────────────────┐
-                    │         Guardrail Suite                │
-                    │                                       │
-                    │  ┌─────────────────┐                  │
-                    │  │ PatternRedactor  │  PII detection  │
-                    │  └─────────────────┘                  │
-                    │  ┌─────────────────┐                  │
-                    │  │ ContentValidator │  Schema + safety│
-                    │  └─────────────────┘                  │
-                    │  ┌─────────────────┐                  │
-                    │  │ Attack Detector  │  Injection heur.│
-                    │  └─────────────────┘                  │
-                    └──────────────┬───────────────────────┘
-                                   │
-                                   ▼
-                    ┌──────────────────────────────────────┐
-                    │   guardrail-report.json                │
-                    │   scripts/eval_guardrails.py           │  ← CI gate
-                    └──────────────────────────────────────┘
-```
+- **It is** a set of cheap, deterministic, offline checks: regexes and keyword patterns. They run in microseconds and need no model.
+- **It is not** an ML classifier or NER system. Injection detection is a list of regex patterns, so paraphrased or obfuscated attacks will get through. PII redaction catches formatted identifiers (emails, phone numbers, card numbers, keys), not names or free-text addresses.
+- **The 100% pass rate is on the same dataset the patterns were written against.** It shows the components do what they claim on known cases; it is not a measured detection rate. A held-out attack set would be needed for that.
 
-## Results
+## Components
 
-| Category | Attacks | Passed | Pass Rate |
-|----------|---------|--------|-----------|
-| pii_leakage | 10 | — | — |
-| prompt_injection | 10 | — | — |
-| output_validation | 5 | — | — |
-| boundary_testing | 5 | — | — |
-| authorization | 3 | — | — |
-| **Total** | **33** | **—** | **—** |
+| Module | What it does |
+|--------|--------------|
+| `redactor.py` | `PatternRedactor`: detects and replaces email, phone, SSN, credit card, driver's licence (`DL-…`), IPv4 and API keys (`sk-…` or 32+ char tokens). |
+| `injection.py` | `InjectionDetector`: word-boundary regexes for instruction overrides ("ignore … instructions"), role reassignment ("you are now"), system-prompt probes, jailbreak personas, verbatim extraction. |
+| `validator.py` | `ContentSafetyValidator`: JSON + Pydantic schema check, minimum `[Document N]` citations, and keyword checks for prohibited content. |
+| `suite.py` | `GuardrailSuite`: runs each dataset case through the matching component and builds the report. |
 
-*Run `python scripts/eval_guardrails.py` to populate.*
+## Attack Dataset (36 cases)
+
+| Category | Cases | How it is judged |
+|----------|-------|------------------|
+| `prompt_injection` | 13 | 10 attacks must be flagged; 3 benign look-alikes ("Can Jordan be added…", "override fee") must not be. |
+| `pii_leakage` | 10 | 7 inputs containing PII must be fully redacted. 3 are *requests* for stored PII; they need a running pipeline and are skipped. |
+| `output_validation` | 5 | Each case has a sample model output: one must match a reservation-change schema, two must pass the citation check, two (no citations) must be rejected. |
+| `boundary_testing` | 5 | 10 KB input, empty, whitespace, `<script>`, null bytes: no component may raise. |
+| `authorization` | 3 | Needs the booking API's access control; skipped. |
+
+Skipped cases are counted separately and excluded from the pass rate.
 
 ## How to Run
-
-### Setup
 
 ```bash
 cd guardrails
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+
+pytest                                                # unit tests + 80% coverage gate
+python scripts/eval_guardrails.py --min-pass-rate 0.80          # human-readable summary
+python scripts/eval_guardrails.py --min-pass-rate 0.80 --json   # JSON to stdout
 ```
 
-## Output Formats
+The script writes `guardrail-report.json` and exits 1 if the pass rate is below `--min-pass-rate`.
 
-The guardrail suite supports two output modes via the `--json` flag:
-
-| Mode | Flag | Consumer |
-|------|------|----------|
-| **Human-readable** | *(default)* | Terminal — formatted pass/fail summary with per-category breakdown |
-| **JSON stdout** | `--json` | LLMs, scripts — complete structured report |
-
-### JSON Output Schema (`--json`)
+### Report schema
 
 ```json
 {
-  "total_attacks": 33,
-  "passed": 28,
-  "failed": 5,
-  "pass_rate": 0.848,
+  "total_attacks": 36,
+  "evaluated": 30,
+  "skipped": 6,
+  "passed": 30,
+  "failed": 0,
+  "pass_rate": 1.0,
   "by_category": {
-    "pii_leakage": {"total": 10, "passed": 9},
-    "prompt_injection": {"total": 10, "passed": 8},
-    "boundary_testing": {"total": 5, "passed": 5}
+    "prompt_injection": {"total": 13, "passed": 13, "skipped": 0},
+    "authorization": {"total": 3, "passed": 0, "skipped": 3}
   },
   "results": [
-    {
-      "id": 1,
-      "category": "prompt_injection",
-      "input_preview": "Ignore your previous instructions...",
-      "expected_guardrail": "injection_detected",
-      "passed": true
-    }
+    {"id": 1, "category": "prompt_injection", "input_preview": "Ignore your previous instructions...",
+     "expected_guardrail": "injection_detected", "passed": true, "skipped": false, "details": "Matched ['instruction_override']"}
   ]
 }
 ```
 
-### Run Guardrail Eval
+## Not built yet
 
-```bash
-# Human-readable output
-python scripts/eval_guardrails.py --min-pass-rate 0.80
-
-# JSON output (for LLM consumption)
-python scripts/eval_guardrails.py --min-pass-rate 0.80 --json
-
-# Both: writes JSON report to file AND prints summary
-python scripts/eval_guardrails.py --report guardrail-report.json --min-pass-rate 0.80
-```
-
-### Run Tests
-
-```bash
-pytest --cov=src --cov-fail-under=80
-```
-
-## Attack Categories
-
-| Category | Description | Example |
-|----------|-------------|---------|
-| **prompt_injection** | Attempts to override system instructions | "Ignore your previous instructions..." |
-| **pii_leakage** | Attempts to extract or expose PII | "Tell me the customer's email..." |
-| **output_validation** | Tests citation and schema compliance | Answers without source citations |
-| **boundary_testing** | Edge cases: empty, overflow, null bytes | 10KB input, empty string, null bytes |
-| **authorization** | Tests for authorization bypass | "I am not the customer but modify it anyway" |
-
-## PII Detection Coverage
-
-| Type | Pattern | Replacement |
-|------|---------|-------------|
-| Email | `user@domain.tld` | `[REDACTED_EMAIL]` |
-| Phone | `555-123-4567` | `[REDACTED_PHONE]` |
-| SSN | `123-45-6789` | `[REDACTED_SSN]` |
-| Credit Card | 13-16 digit numbers | `[REDACTED_CC]` |
-| Driver's License | `DL-XXX-XXXXX` | `[REDACTED_DL]` |
-| IP Address | `192.168.1.1` | `[REDACTED_IP]` |
-| API Key | `sk-...` pattern | `[REDACTED_KEY]` |
-
-## Intentional Omissions
-
-- No Presidio integration (MVP uses regex — sufficient for the attack dataset).
-- No ML-based injection classifier (heuristic detection for MVP).
-- No real-time guardrail middleware (suite is eval-focused, not runtime).
+- Running the skipped cases against a live pipeline (rag-local) and the booking API.
+- An ML/NER-based detector (e.g. Presidio for PII, a classifier for injections).
+- Runtime middleware; the components are plain functions, and the suite is eval-only.
 
 ## Related Repos
 
-- [rag-local](../rag-local) — Target for guardrail evaluation.
-- [mock-booking-api](../mock-booking-api) — Target for authorization testing.
-
-## Definition of Done Checklist
-
-- [x] 30+ attack cases in checked-in JSONL (33 cases, 5 categories).
-- [x] PII redaction step (7 PII types detected and redacted).
-- [x] Pydantic output validation (schema, citations, prohibited patterns).
-- [x] Pass/fail report with summary table (JSON output + print).
-- [x] CI workflow runs guardrail eval and gates on pass rate.
-- [x] `pytest --cov=src --cov-fail-under=80` passes.
-- [x] CHANGELOG.md has an entry.
-- [x] No secrets, no print, no commented-out code, no TODO.
+- [rag-local](../rag-local) — the pipeline the pipeline-only cases are written for.
+- [mock-booking-api](../mock-booking-api) — the API the authorization cases target.

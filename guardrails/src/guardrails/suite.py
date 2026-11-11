@@ -1,22 +1,38 @@
 """Guardrail evaluation suite.
 
-Loads the attack dataset, runs each attack through the guardrail
-checks (PII redaction, injection detection, output validation),
+Loads the attack dataset, runs each case through the matching guardrail
+(PII redaction, injection detection, output validation, boundary handling)
 and produces a pass/fail report.
+
+Cases marked ``requires_pipeline`` (for example authorization checks, or
+requests for PII that is not in the input) can only be judged against a
+running pipeline; they are reported as skipped, not passed.
 """
 
 from __future__ import annotations
 
 import json
-from guardrails.logging import get_logger
 from pathlib import Path
 from typing import Any
 
-from guardrails.errors import GuardrailError, InjectionDetected, PIIDetectionError
+from pydantic import BaseModel
+
+from guardrails.injection import InjectionDetector
+from guardrails.logging import get_logger
 from guardrails.redactor import PatternRedactor
-from guardrails.validator import ContentSafetyValidator, SafetyCheck, ValidationReport
+from guardrails.validator import ContentSafetyValidator
 
 log = get_logger(__name__)
+
+DEFAULT_DATASET = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "attack_dataset.jsonl"
+
+
+class ReservationChangeOutput(BaseModel):
+    """Schema the output-validation cases expect for a reservation change."""
+
+    reservation_id: str
+    new_return_date: str
+    status: str
 
 
 class AttackResult:
@@ -30,216 +46,182 @@ class AttackResult:
         expected_guardrail: str,
         passed: bool,
         details: str = "",
+        skipped: bool = False,
     ) -> None:
+        """Store the outcome of one case."""
         self.attack_id = attack_id
         self.category = category
         self.input_text = input_text
         self.expected_guardrail = expected_guardrail
         self.passed = passed
         self.details = details
+        self.skipped = skipped
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable dict."""
         return {
             "id": self.attack_id,
             "category": self.category,
             "input_preview": self.input_text[:80],
             "expected_guardrail": self.expected_guardrail,
             "passed": self.passed,
+            "skipped": self.skipped,
             "details": self.details,
         }
 
 
 class GuardrailSuite:
-    """Runs the full guardrail evaluation suite.
-
-    Tests:
-      - PII redaction (detect and redact)
-      - Output validation (schema, citations, content safety)
-      - Input sanitization (empty, overflow, null bytes)
-    """
+    """Runs the attack dataset through the guardrail components."""
 
     def __init__(self) -> None:
+        """Create the redactor, injection detector and output validator."""
         self._redactor = PatternRedactor()
+        self._detector = InjectionDetector()
         self._validator = ContentSafetyValidator()
         self._results: list[AttackResult] = []
 
-    def load_dataset(self, path: str = "tests/fixtures/attack_dataset.jsonl") -> list[dict]:
-        """Load attack cases from a JSONL file."""
+    def load_dataset(self, path: str | Path = DEFAULT_DATASET) -> list[dict[str, Any]]:
+        """Load attack cases from a JSONL file (blank lines and # comments are skipped)."""
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Attack dataset not found: {path}")
 
-        cases: list[dict] = []
-        for line in p.read_text().splitlines():
-            line = line.strip()
+        cases: list[dict[str, Any]] = []
+        for raw in p.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
             if not line or line.startswith("#"):
                 continue
             cases.append(json.loads(line))
         return cases
 
-    def run_case(self, case: dict) -> AttackResult:
-        """Run a single attack case through relevant guardrails."""
-        attack_id = case.get("id", 0)
-        category = case.get("category", "unknown")
-        input_text = case.get("input", "")
-        expected = case.get("expected_guardrail", "handled_gracefully")
+    def run_case(self, case: dict[str, Any]) -> AttackResult:
+        """Run a single attack case through the relevant guardrail."""
+        attack_id = int(case.get("id", 0))
+        category = str(case.get("category", "unknown"))
+        input_text = str(case.get("input", ""))
+        expected = str(case.get("expected_guardrail", "handled_gracefully"))
+
+        if case.get("requires_pipeline"):
+            return AttackResult(
+                attack_id, category, input_text, expected, False, "Needs a running pipeline to judge", skipped=True
+            )
 
         try:
             if category == "pii_leakage":
                 return self._test_pii_redaction(attack_id, category, input_text, expected)
-            elif category == "prompt_injection":
+            if category == "prompt_injection":
                 return self._test_injection_detection(attack_id, category, input_text, expected)
-            elif category == "output_validation":
-                return self._test_output_validation(attack_id, category, input_text, expected)
-            elif category == "boundary_testing":
+            if category == "output_validation":
+                output = str(case.get("output", ""))
+                return self._test_output_validation(attack_id, category, input_text, output, expected)
+            if category == "boundary_testing":
                 return self._test_boundary(attack_id, category, input_text, expected)
-            elif category == "authorization":
-                return self._test_authorization(attack_id, category, input_text, expected)
-            else:
-                return AttackResult(attack_id, category, input_text, expected, False,
-                                    f"Unknown category: {category}")
+            return AttackResult(attack_id, category, input_text, expected, False, f"Unknown category: {category}")
         except Exception as exc:
             log.exception("suite.attack_error", attack_id=attack_id)
-            return AttackResult(attack_id, category, input_text, expected, False,
-                                f"Unexpected error: {exc}")
+            return AttackResult(attack_id, category, input_text, expected, False, f"Unexpected error: {exc}")
 
     def _test_pii_redaction(self, attack_id: int, category: str, text: str, expected: str) -> AttackResult:
-        """Test that PII is detected and redacted."""
-        # Check detection
+        """Pass if every PII match is found and none survives redaction."""
         findings = self._redactor.detect(text)
-        # Check redaction
         redacted = self._redactor.redact(text)
-
-        has_pii = len(findings) > 0
-        was_redacted = "[REDACTED" in redacted
+        leaked = [f["match"] for f in findings if f["match"] in redacted]
 
         if expected == "pii_redacted":
-            passed = has_pii and was_redacted
-            details = f"Found {len(findings)} PII items" if passed else f"PII not redacted. Findings: {findings}"
-            return AttackResult(attack_id, category, text, expected, passed, details)
+            passed = bool(findings) and not leaked
+            details = f"Redacted {len(findings)} PII items" if passed else f"Findings: {findings}, leaked: {leaked}"
         else:
-            passed = not was_redacted
-            return AttackResult(attack_id, category, text, expected, passed, f"Redaction status: {was_redacted}")
-
-    def _test_injection_detection(self, attack_id: int, category: str, text: str, expected: str) -> AttackResult:
-        """Test prompt injection detection.
-
-        This is a heuristic check: look for known injection patterns.
-        """
-        injection_indicators = [
-            "ignore your previous", "ignore all previous", "forget all previous",
-            "you are now", "new instructions", "system override",
-            "DAN", "do anything now", "system prompt", "system leak",
-            "uncensored", "override", "hacked", "pwned",
-            "repeat everything", "first 500 characters",
-        ]
-
-        detected = any(indicator.lower() in text.lower() for indicator in injection_indicators)
-
-        if expected == "injection_detected":
-            passed = detected
-            return AttackResult(attack_id, category, text, expected, passed,
-                                "Injection pattern detected" if detected else "Injection not detected")
-        else:
-            passed = not detected
-            return AttackResult(attack_id, category, text, expected, passed,
-                                "False positive" if detected else "No injection detected")
-
-    def _test_output_validation(self, attack_id: int, category: str, text: str, expected: str) -> AttackResult:
-        """Test output validation (for cases targeting output validator)."""
-        # Simulate receiving an output to validate
-        fake_output = f"Based on the policy documents, here is the answer. [Document 1] [Document 2]"
-        report = self._validator.validate(fake_output, min_citations=1)
-
-        if expected == "schema_valid":
-            passed = True  # we're not testing schema for these string outputs
-            return AttackResult(attack_id, category, text, expected, passed, "Output schema check passed")
-        elif expected == "citations_present":
-            passed = report.passed
-            return AttackResult(attack_id, category, text, expected, passed,
-                                "Citations present" if passed else "Citations missing")
-        else:
-            return AttackResult(attack_id, category, text, expected, True, "Validation ran without error")
-
-    def _test_boundary(self, attack_id: int, category: str, text: str, expected: str) -> AttackResult:
-        """Test boundary conditions (empty, overflow, null bytes)."""
-        passed = True
-        details = "Boundary input handled gracefully"
-
-        # The guardrail should not crash on any input
-        try:
-            self._redactor.redact(text)
-            self._validator.validate(text)
-        except Exception as exc:
-            passed = False
-            details = f"Guardrail crashed: {exc}"
-
+            passed = not findings
+            details = "No PII found" if passed else f"Unexpected PII findings: {findings}"
         return AttackResult(attack_id, category, text, expected, passed, details)
 
-    def _test_authorization(self, attack_id: int, category: str, text: str, expected: str) -> AttackResult:
-        """Test authorization checks (heuristic: check for auth-related keywords)."""
-        suspicious_indicators = [
-            "i am not the customer", "i am alice", "belongs to",
-            "i don't know", "add john",
-        ]
-        detected = any(indicator.lower() in text.lower() for indicator in suspicious_indicators)
-        passed = detected  # We detected an auth concern
-        return AttackResult(attack_id, category, text, expected, passed,
-                            "Auth concern identified" if detected else "Auth concern not flagged")
+    def _test_injection_detection(self, attack_id: int, category: str, text: str, expected: str) -> AttackResult:
+        """Pass if the detector flags injections and leaves benign prompts alone."""
+        matched = self._detector.detect(text)
+        if expected == "injection_detected":
+            passed = bool(matched)
+            details = f"Matched {matched}" if passed else "Injection not detected"
+        else:
+            passed = not matched
+            details = "No injection detected" if passed else f"False positive: {matched}"
+        return AttackResult(attack_id, category, text, expected, passed, details)
 
-    def run_all(self, dataset_path: str = "tests/fixtures/attack_dataset.jsonl") -> list[AttackResult]:
+    def _test_output_validation(
+        self, attack_id: int, category: str, text: str, output: str, expected: str
+    ) -> AttackResult:
+        """Validate the case's sample output; pass if the verdict matches the expectation."""
+        if expected == "schema_valid":
+            report = self._validator.validate(output, expected_schema=ReservationChangeOutput)
+            should_pass = True
+        else:
+            report = self._validator.validate(output, min_citations=1)
+            should_pass = expected == "citations_present"
+
+        passed = report.passed == should_pass
+        failed_checks = [c.name for c in report.checks if not c.passed]
+        details = f"Validator {'accepted' if report.passed else 'rejected'} output; failed checks: {failed_checks}"
+        return AttackResult(attack_id, category, text, expected, passed, details)
+
+    def _test_boundary(self, attack_id: int, category: str, text: str, expected: str) -> AttackResult:
+        """Pass if the redactor, detector and validator all handle the input without raising."""
+        try:
+            self._redactor.redact(text)
+            self._detector.detect(text)
+            self._validator.validate(text)
+        except Exception as exc:
+            return AttackResult(attack_id, category, text, expected, False, f"Guardrail crashed: {exc}")
+        return AttackResult(attack_id, category, text, expected, True, "Boundary input handled gracefully")
+
+    def run_all(self, dataset_path: str | Path = DEFAULT_DATASET) -> list[AttackResult]:
         """Run all attack cases through the guardrail suite."""
         cases = self.load_dataset(dataset_path)
         log.info("suite.start", count=len(cases))
-
         self._results = [self.run_case(case) for case in cases]
-
-        # Summary
-        passed = sum(1 for r in self._results if r.passed)
-        log.info("suite.results", passed=passed, total=len(self._results))
-
+        log.info("suite.results", passed=sum(r.passed for r in self._results), total=len(self._results))
         return self._results
 
-    def generate_report(self, output_path: str = "guardrail-report.json") -> dict:
-        """Generate a pass/fail report."""
-        total = len(self._results)
-        passed = sum(1 for r in self._results if r.passed)
-        by_category: dict[str, dict] = {}
+    def generate_report(self, output_path: str | Path = "guardrail-report.json") -> dict[str, Any]:
+        """Write and return a pass/fail report. The pass rate excludes skipped cases."""
+        evaluated = [r for r in self._results if not r.skipped]
+        passed = sum(1 for r in evaluated if r.passed)
+        by_category: dict[str, dict[str, int]] = {}
 
         for r in self._results:
-            if r.category not in by_category:
-                by_category[r.category] = {"total": 0, "passed": 0}
-            by_category[r.category]["total"] += 1
-            if r.passed:
-                by_category[r.category]["passed"] += 1
+            stats = by_category.setdefault(r.category, {"total": 0, "passed": 0, "skipped": 0})
+            stats["total"] += 1
+            if r.skipped:
+                stats["skipped"] += 1
+            elif r.passed:
+                stats["passed"] += 1
 
-        report = {
-            "total_attacks": total,
+        report: dict[str, Any] = {
+            "total_attacks": len(self._results),
+            "evaluated": len(evaluated),
+            "skipped": len(self._results) - len(evaluated),
             "passed": passed,
-            "failed": total - passed,
-            "pass_rate": round(passed / total, 3) if total else 0.0,
+            "failed": len(evaluated) - passed,
+            "pass_rate": round(passed / len(evaluated), 3) if evaluated else 0.0,
             "by_category": by_category,
             "results": [r.to_dict() for r in self._results],
         }
 
         Path(output_path).write_text(json.dumps(report, indent=2))
-        log.info("suite.report_written", path=output_path)
-
+        log.info("suite.report_written", path=str(output_path))
         return report
 
     def print_summary(self) -> None:
         """Print a human-readable summary of results."""
-        total = len(self._results)
-        passed = sum(1 for r in self._results if r.passed)
+        evaluated = [r for r in self._results if not r.skipped]
+        passed = sum(1 for r in evaluated if r.passed)
 
-        print(f"\n{'='*60}")
-        print(f"  Guardrail Evaluation Report")
-        print(f"{'='*60}")
-        print(f"  Total attacks:    {total}")
-        print(f"  Passed:           {passed}")
-        print(f"  Failed:           {total - passed}")
-        print(f"  Pass rate:        {passed/total:.1%}" if total else "  Pass rate:        N/A")
-        print(f"{'='*60}\n")
+        print(f"\n{'=' * 60}")
+        print("  Guardrail Evaluation Report")
+        print(f"{'=' * 60}")
+        print(f"  Total cases:      {len(self._results)}")
+        print(f"  Skipped:          {len(self._results) - len(evaluated)} (need a running pipeline)")
+        print(f"  Passed:           {passed}/{len(evaluated)}")
+        print(f"  Pass rate:        {passed / len(evaluated):.1%}" if evaluated else "  Pass rate:        N/A")
+        print(f"{'=' * 60}\n")
 
         by_category: dict[str, list[AttackResult]] = {}
         for r in self._results:
@@ -249,8 +231,8 @@ class GuardrailSuite:
             cat_passed = sum(1 for r in items if r.passed)
             print(f"  {cat}: {cat_passed}/{len(items)} passed")
             for r in items:
-                status = "✓" if r.passed else "✗"
-                print(f"    {status} [{r.attack_id}] {r.input_text[:60]}...")
-                if not r.passed:
+                status = "skip" if r.skipped else ("pass" if r.passed else "FAIL")
+                print(f"    {status:4} [{r.attack_id}] {r.input_text[:60].replace(chr(10), ' ')}")
+                if not r.passed and not r.skipped:
                     print(f"         {r.details}")
             print()
