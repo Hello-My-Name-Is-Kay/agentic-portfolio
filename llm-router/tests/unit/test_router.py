@@ -6,7 +6,7 @@ import pytest
 
 from llm_router.budget import Budget
 from llm_router.cache import ResponseCache
-from llm_router.errors import AllProvidersFailed, BudgetExceeded, ProviderError
+from llm_router.errors import AllProvidersFailedError, BudgetExceededError, ProviderError
 from llm_router.models import LLMResponse
 from llm_router.router import Router
 
@@ -26,7 +26,7 @@ class FakeProvider:
         self._should_fail = True
         self._fail_with = exc
 
-    async def generate(self, prompt: str, request_id: str | None = None) -> LLMResponse:
+    async def generate(self, prompt: str, request_id: str | None = None) -> LLMResponse:  # noqa: ARG002
         self._call_count += 1
         if self._should_fail:
             self._should_fail = False
@@ -53,40 +53,47 @@ def fake_providers() -> list[FakeProvider]:
 
 
 @pytest.fixture
-def router(fake_providers) -> Router:
+def router(fake_providers: list[FakeProvider]) -> Router:
     return Router(providers=fake_providers)
 
 
 class TestRouter:
     """Tests for the Router class."""
 
-    async def test_happy_path_uses_first_provider(self, router) -> None:
+    async def test_happy_path_uses_first_provider(self, router: Router) -> None:
         resp = await router.generate("Hello")
         assert resp.provider == "primary"
         assert "primary" in resp.text
 
-    async def test_fallback_to_secondary(self, fake_providers) -> None:
+    async def test_fallback_to_secondary(self, fake_providers: list[FakeProvider]) -> None:
         fake_providers[0].fail_next()
         router = Router(providers=fake_providers)
         resp = await router.generate("Hello")
         assert resp.provider == "secondary"
         assert "secondary" in resp.text
 
-    async def test_fallback_to_tertiary(self, fake_providers) -> None:
+    async def test_fallback_to_tertiary(self, fake_providers: list[FakeProvider]) -> None:
         fake_providers[0].fail_next()
         fake_providers[1].fail_next()
         router = Router(providers=fake_providers)
         resp = await router.generate("Hello")
         assert resp.provider == "tertiary"
 
-    async def test_all_providers_fail_raises(self, fake_providers) -> None:
+    async def test_all_providers_fail_raises(self, fake_providers: list[FakeProvider]) -> None:
         for p in fake_providers:
             p.fail_next()
         router = Router(providers=fake_providers)
-        with pytest.raises(AllProvidersFailed):
+        with pytest.raises(AllProvidersFailedError) as info:
             await router.generate("Hello")
+        assert [e.split(":")[0] for e in info.value.errors] == ["primary", "secondary", "tertiary"]
 
-    async def test_cache_hit_returns_cached(self, fake_providers) -> None:
+    async def test_unexpected_exception_falls_back(self, fake_providers: list[FakeProvider]) -> None:
+        fake_providers[0].fail_next(RuntimeError)
+        router = Router(providers=fake_providers)
+        resp = await router.generate("Hello")
+        assert resp.provider == "secondary"
+
+    async def test_cache_hit_returns_cached(self, fake_providers: list[FakeProvider]) -> None:
         router = Router(providers=fake_providers)
 
         # First call — should hit primary
@@ -98,32 +105,49 @@ class TestRouter:
         resp2 = await router.generate("Hello")
         assert resp2.provider == "primary"
         assert resp2.text == resp1.text
+        assert resp2.cached is True
+        assert resp1.cached is False
+        assert fake_providers[0].call_count == 1
 
-    async def test_empty_prompt_raises(self, router) -> None:
+    async def test_empty_prompt_raises(self, router: Router) -> None:
         with pytest.raises(ProviderError, match="empty prompt"):
             await router.generate("")
 
-    async def test_budget_tracks_tokens(self, fake_providers) -> None:
+    async def test_budget_tracks_tokens(self, fake_providers: list[FakeProvider]) -> None:
         budget = Budget(max_tokens_in=1000, max_tokens_out=500, max_cost_usd=10.0)
         router = Router(providers=fake_providers, budget=budget)
         await router.generate("Hello")
-        assert budget.total_tokens_in > 0
-        assert budget.total_tokens_out > 0
-        assert budget.total_cost_usd > 0
+        assert budget.total_tokens_in == 10
+        assert budget.total_tokens_out == 20
+        assert budget.total_cost_usd == 0.0001
 
-    async def test_budget_exceeded_raises(self, fake_providers) -> None:
+    async def test_budget_exceeded_raises(self, fake_providers: list[FakeProvider]) -> None:
         budget = Budget(max_tokens_in=5, max_tokens_out=500, max_cost_usd=10.0)
         router = Router(providers=fake_providers, budget=budget)
-        with pytest.raises(BudgetExceeded):
+        with pytest.raises(BudgetExceededError):
             await router.generate("Hello" * 100)
 
-    async def test_provider_not_called_after_budget_exceeded(self, fake_providers) -> None:
-        """After budget is exceeded, subsequent calls should immediately raise."""
-        budget = Budget(max_cost_usd=0.0)
+    async def test_provider_not_called_after_budget_exceeded(self, fake_providers: list[FakeProvider]) -> None:
+        budget = Budget(max_tokens_in=5)
         router = Router(providers=fake_providers, budget=budget)
-        await router.generate("Hello")  # this should raise BudgetExceeded
-        # ... actually the first call would exceed budget
-        # This test verifies the provider was still called before budget check
+        with pytest.raises(BudgetExceededError):
+            await router.generate("first")  # spends 10 tokens in, goes over
+        assert fake_providers[0].call_count == 1
+        with pytest.raises(BudgetExceededError, match="total_tokens_in"):
+            await router.generate("second")
+        assert fake_providers[0].call_count == 1  # refused before calling the provider
+
+    async def test_zero_cost_budget_blocks_first_call(self, fake_providers: list[FakeProvider]) -> None:
+        router = Router(providers=fake_providers, budget=Budget(max_cost_usd=0.0))
+        with pytest.raises(BudgetExceededError, match="total_cost_usd"):
+            await router.generate("Hello")
+        assert fake_providers[0].call_count == 0
+
+    async def test_add_provider(self) -> None:
+        router = Router()
+        router.add_provider(FakeProvider("late"))
+        assert [p.name for p in router.providers] == ["late"]
+        assert (await router.generate("hi")).provider == "late"
 
 
 class TestResponseCache:
@@ -141,19 +165,38 @@ class TestResponseCache:
         assert cached is not None
         assert cached.text == "Hello"
 
-    def test_cache_expires(self) -> None:
-        cache = ResponseCache(ttl_s=0)  # zero TTL = no caching
+    def test_zero_ttl_disables_cache(self) -> None:
+        cache = ResponseCache(ttl_s=0)
         resp = LLMResponse(text="Hello", provider="test", model="m", latency_ms=100, tokens_in=10, tokens_out=20)
         cache.set("test", "m", "prompt", resp)
         cached = cache.get("test", "m", "prompt")
         assert cached is None
 
-    def test_cache_max_size(self) -> None:
+    def test_cache_max_size_evicts_least_recently_used(self) -> None:
         cache = ResponseCache(ttl_s=300, max_size=2)
-        for i in range(4):
-            resp = LLMResponse(text=str(i), provider="test", model="m", latency_ms=100, tokens_in=10, tokens_out=20)
-            cache.set("test", "m", f"prompt{i}", resp)
+        for i in range(2):
+            cache.set("test", "m", f"prompt{i}", LLMResponse(text=str(i), provider="test", model="m"))
+        assert cache.get("test", "m", "prompt0") is not None  # prompt0 is now most recent
+        cache.set("test", "m", "prompt2", LLMResponse(text="2", provider="test", model="m"))
         assert cache.size == 2
+        assert cache.get("test", "m", "prompt1") is None
+        assert cache.get("test", "m", "prompt0") is not None
+
+    def test_cache_entry_expires_after_ttl(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import llm_router.cache as cache_module
+
+        now = [1000.0]
+        monkeypatch.setattr(cache_module.time, "monotonic", lambda: now[0])
+        cache = ResponseCache(ttl_s=10)
+        cache.set("test", "m", "p", LLMResponse(text="x", provider="test", model="m"))
+        now[0] += 11
+        assert cache.get("test", "m", "p") is None
+        assert cache.size == 0
+
+    @pytest.mark.parametrize(("ttl", "size"), [(-1, 10), (10, 0)])
+    def test_invalid_config(self, ttl: int, size: int) -> None:
+        with pytest.raises(ValueError):
+            ResponseCache(ttl_s=ttl, max_size=size)
 
     def test_cache_clear(self) -> None:
         cache = ResponseCache(ttl_s=300)
@@ -169,7 +212,9 @@ class TestBudget:
 
     def test_record_updates_counts(self) -> None:
         budget = Budget()
-        resp = LLMResponse(text="", provider="test", model="m", latency_ms=100, tokens_in=50, tokens_out=30, cost_usd=0.001)
+        resp = LLMResponse(
+            text="", provider="test", model="m", latency_ms=100, tokens_in=50, tokens_out=30, cost_usd=0.001
+        )
         budget.record(resp)
         assert budget.total_tokens_in == 50
         assert budget.total_tokens_out == 30
@@ -177,19 +222,37 @@ class TestBudget:
 
     def test_budget_exceeded_on_tokens_in(self) -> None:
         budget = Budget(max_tokens_in=10, max_tokens_out=1000, max_cost_usd=10.0)
-        resp = LLMResponse(text="", provider="test", model="m", latency_ms=100, tokens_in=50, tokens_out=30, cost_usd=0.001)
-        with pytest.raises(BudgetExceeded):
+        resp = LLMResponse(
+            text="", provider="test", model="m", latency_ms=100, tokens_in=50, tokens_out=30, cost_usd=0.001
+        )
+        with pytest.raises(BudgetExceededError):
             budget.record(resp)
 
     def test_budget_exceeded_on_cost(self) -> None:
         budget = Budget(max_tokens_in=10000, max_tokens_out=1000, max_cost_usd=0.0)
-        resp = LLMResponse(text="", provider="test", model="m", latency_ms=100, tokens_in=10, tokens_out=5, cost_usd=0.01)
-        with pytest.raises(BudgetExceeded):
+        resp = LLMResponse(
+            text="", provider="test", model="m", latency_ms=100, tokens_in=10, tokens_out=5, cost_usd=0.01
+        )
+        with pytest.raises(BudgetExceededError):
             budget.record(resp)
+
+    def test_budget_exceeded_on_tokens_out(self) -> None:
+        budget = Budget(max_tokens_out=10)
+        with pytest.raises(BudgetExceededError, match="total_tokens_out"):
+            budget.record(LLMResponse(text="", provider="t", model="m", tokens_out=30))
+
+    def test_ensure_available(self) -> None:
+        budget = Budget(max_tokens_in=100, max_tokens_out=10)
+        budget.ensure_available()
+        budget.record(LLMResponse(text="", provider="t", model="m", tokens_in=1, tokens_out=10))
+        with pytest.raises(BudgetExceededError, match="total_tokens_out"):
+            budget.ensure_available()
 
     def test_reset_clears(self) -> None:
         budget = Budget()
-        resp = LLMResponse(text="", provider="test", model="m", latency_ms=100, tokens_in=50, tokens_out=30, cost_usd=0.001)
+        resp = LLMResponse(
+            text="", provider="test", model="m", latency_ms=100, tokens_in=50, tokens_out=30, cost_usd=0.001
+        )
         budget.record(resp)
         budget.reset()
         assert budget.total_tokens_in == 0

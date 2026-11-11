@@ -1,11 +1,4 @@
-# LLM Router — Portfolio Project
-#
-# Multi-provider LLM router with fallback chain, retry per provider,
-# response caching, token/latency/cost tracking, and budget enforcement.
-#
-# Demonstrates: Provider Protocol pattern, fallback resilience,
-# observability (structured logs with provider, latency, tokens, cost),
-# and the principle that every provider call is traceable.
+"""LLM router: try providers in order with retries, caching and a spend budget."""
 
 from __future__ import annotations
 

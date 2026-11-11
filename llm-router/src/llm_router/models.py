@@ -6,7 +6,7 @@ and the LLMResponse data class for structured results.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 
@@ -24,9 +24,11 @@ class LLMResponse:
     cached: bool = False
 
     def __post_init__(self) -> None:
+        """Round the cost estimate to 6 decimal places."""
         self.cost_usd = round(self.cost_usd, 6)
 
     def __repr__(self) -> str:
+        """Return a compact summary (omits the text)."""
         return (
             f"LLMResponse(provider={self.provider}, model={self.model}, "
             f"latency={self.latency_ms:.0f}ms, tokens={self.tokens_in}→{self.tokens_out}, "
@@ -52,7 +54,7 @@ class Provider(Protocol):
             LLMResponse with generated text and metadata.
 
         Raises:
-            TimeoutError: If the call exceeds the configured timeout.
+            ProviderTimeoutError: If the call exceeds the configured timeout.
             ProviderError: For other provider-specific failures.
         """
         ...

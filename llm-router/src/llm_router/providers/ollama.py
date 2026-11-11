@@ -1,26 +1,23 @@
-"""Ollama (local) provider implementation.
-
-Calls a local Ollama instance for LLM generation with retry logic,
-timeout, and structured logging.
-"""
+"""Ollama (local) provider (generate API)."""
 
 from __future__ import annotations
 
-from llm_router.logging import get_logger
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
-from llm_router.errors import ProviderError, TimeoutError
+from llm_router.errors import ProviderError
+from llm_router.logging import get_logger
 from llm_router.models import LLMResponse
+from llm_router.providers._http import post_json, with_retries
+
+if TYPE_CHECKING:
+    import httpx
 
 log = get_logger(__name__)
 
 
 class OllamaProvider:
-    """Provider wrapper for local Ollama models."""
+    """Provider wrapper for local Ollama models. Cost is reported as 0."""
 
     def __init__(
         self,
@@ -28,35 +25,36 @@ class OllamaProvider:
         model: str = "llama3.2",
         timeout_s: float = 60.0,
         max_retries: int = 2,
+        retry_wait_s: float = 0.5,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        """Configure the provider.
+
+        Args:
+            base_url: Ollama server URL.
+            model: Local model name.
+            timeout_s: Per-request timeout in seconds.
+            max_retries: Retries after the first attempt for transient errors (timeouts, 429, 5xx, connection).
+            retry_wait_s: Backoff multiplier in seconds (exponential, capped at 4s).
+            transport: Optional httpx transport (tests use a mock transport).
+        """
         self.name = "ollama"
         self.model = model
         self.timeout_s = timeout_s
         self._base_url = base_url.rstrip("/")
         self._max_retries = max_retries
+        self._retry_wait_s = retry_wait_s
+        self._transport = transport
 
-        log.info("provider.configured", name=self.name, model=model,
-                 self.name, model, self._base_url, timeout_s)
+        log.info("provider.configured", name=self.name, model=model, base_url=self._base_url, timeout_s=timeout_s)
 
-    @retry(
-        retry=retry_if_exception_type((TimeoutError, httpx.TimeoutException, httpx.TransportError, httpx.RemoteProtocolError)),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.5, max=4),
-        reraise=True,
-    )
     async def generate(self, prompt: str, request_id: str | None = None) -> LLMResponse:
         """Generate a response using an Ollama local model.
 
-        Args:
-            prompt: The input prompt.
-            request_id: Optional correlation ID.
-
-        Returns:
-            LLMResponse with generated text and metadata.
-
         Raises:
-            TimeoutError: If the local call times out.
-            ProviderError: If Ollama returns an error or is unavailable.
+            ProviderTimeoutError: If every attempt timed out.
+            RetryableProviderError: If Ollama stayed unreachable or kept returning 5xx.
+            ProviderError: For empty prompts or other errors.
         """
         if not prompt or not prompt.strip():
             raise ProviderError("Cannot generate with empty prompt")
@@ -65,45 +63,30 @@ class OllamaProvider:
             "model": self.model,
             "prompt": prompt,
             "stream": False,
-            "options": {
-                "temperature": 0.1,
-                "num_predict": 1024,
-            },
+            "options": {"temperature": 0.1, "num_predict": 1024},
         }
-
-        url = f"{self._base_url}/api/generate"
 
         log.info("llm.call.start", provider=self.name, model=self.model, request_id=request_id, prompt_len=len(prompt))
         start = time.monotonic()
 
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
-                response = await client.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
-        except httpx.TimeoutException as exc:
-            log.warning("llm.call.timeout", provider=self.name, timeout_s=self.timeout_s, request_id=request_id)
-            raise TimeoutError(f"Ollama timeout after {self.timeout_s}s") from exc
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            body = exc.response.text[:500]
-            log.error("llm.call.http_error", provider=self.name, status_code=status, request_id=request_id)
-            raise ProviderError(f"Ollama HTTP {status}: {body}") from exc
-        except httpx.RequestError as exc:
-            log.warning("llm.call.connection_error", provider=self.name, request_id=request_id, error=str(exc))
-            raise ProviderError(f"Ollama unavailable at {self._base_url}: {exc}") from exc
+        data = await with_retries(
+            lambda: post_json(
+                provider=self.name,
+                url=f"{self._base_url}/api/generate",
+                payload=payload,
+                timeout_s=self.timeout_s,
+                transport=self._transport,
+                request_id=request_id,
+            ),
+            max_retries=self._max_retries,
+            wait_s=self._retry_wait_s,
+        )
 
-        elapsed = time.monotonic() - start
-        latency_ms = round(elapsed * 1000, 1)
-
-        text = data.get("response", "")
-
-        # Ollama doesn't always return token counts; estimate
-        tokens_in = data.get("prompt_eval_count", len(prompt) // 4)
-        tokens_out = data.get("eval_count", len(text) // 4)
-
-        # Local model: essentially free
-        cost_usd = 0.0
+        latency_ms = round((time.monotonic() - start) * 1000, 1)
+        text = str(data.get("response", ""))
+        # Ollama does not always return token counts; fall back to a ~4 chars/token estimate.
+        tokens_in = int(data.get("prompt_eval_count", len(prompt) // 4))
+        tokens_out = int(data.get("eval_count", len(text) // 4))
 
         log.info(
             "llm.call.ok",
@@ -123,5 +106,5 @@ class OllamaProvider:
             latency_ms=latency_ms,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
-            cost_usd=cost_usd,
+            cost_usd=0.0,
         )

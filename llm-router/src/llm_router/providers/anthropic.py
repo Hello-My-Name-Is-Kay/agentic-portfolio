@@ -1,20 +1,17 @@
-"""Anthropic Claude provider implementation.
-
-Calls the Anthropic Messages API with retry logic, timeout,
-and structured logging.
-"""
+"""Anthropic Claude provider (Messages API)."""
 
 from __future__ import annotations
 
-from llm_router.logging import get_logger
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from llm_router.errors import ProviderError
+from llm_router.logging import get_logger
+from llm_router.models import LLMResponse
+from llm_router.providers._http import post_json, with_retries
 
-from llm_router.errors import ProviderError, TimeoutError
-from llm_router.models import LLMResponse, Provider
+if TYPE_CHECKING:
+    import httpx
 
 log = get_logger(__name__)
 
@@ -31,7 +28,23 @@ class AnthropicProvider:
         model: str = "claude-sonnet-4-5",
         timeout_s: float = 30.0,
         max_retries: int = 3,
+        retry_wait_s: float = 0.5,
+        cost_per_m_in: float = 3.0,
+        cost_per_m_out: float = 15.0,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        """Configure the provider.
+
+        Args:
+            api_key: Anthropic API key.
+            model: Model ID.
+            timeout_s: Per-request timeout in seconds.
+            max_retries: Retries after the first attempt for transient errors (timeouts, 429, 5xx, connection).
+            retry_wait_s: Backoff multiplier in seconds (exponential, capped at 4s).
+            cost_per_m_in: USD per million input tokens, used for the cost estimate.
+            cost_per_m_out: USD per million output tokens, used for the cost estimate.
+            transport: Optional httpx transport (tests use a mock transport).
+        """
         if not api_key:
             raise ProviderError("Anthropic API key is required")
 
@@ -40,28 +53,20 @@ class AnthropicProvider:
         self.timeout_s = timeout_s
         self._api_key = api_key
         self._max_retries = max_retries
+        self._retry_wait_s = retry_wait_s
+        self._cost_per_m_in = cost_per_m_in
+        self._cost_per_m_out = cost_per_m_out
+        self._transport = transport
 
         log.info("provider.configured", name=self.name, model=model, timeout_s=timeout_s)
 
-    @retry(
-        retry=retry_if_exception_type((TimeoutError, httpx.TimeoutException, httpx.TransportError)),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.5, max=4),
-        reraise=True,
-    )
     async def generate(self, prompt: str, request_id: str | None = None) -> LLMResponse:
         """Generate a response using Anthropic's API.
 
-        Args:
-            prompt: The input prompt.
-            request_id: Optional correlation ID.
-
-        Returns:
-            LLMResponse with generated text and metadata.
-
         Raises:
-            TimeoutError: If the API call times out.
-            ProviderError: For authentication, rate limiting, or server errors.
+            ProviderTimeoutError: If every attempt timed out.
+            RetryableProviderError: If transient errors persisted through all retries.
+            ProviderError: For empty prompts, authentication or other client errors.
         """
         if not prompt or not prompt.strip():
             raise ProviderError("Cannot generate with empty prompt")
@@ -71,7 +76,6 @@ class AnthropicProvider:
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-
         payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": 1024,
@@ -81,47 +85,25 @@ class AnthropicProvider:
         log.info("llm.call.start", provider=self.name, model=self.model, request_id=request_id, prompt_len=len(prompt))
         start = time.monotonic()
 
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
-                response = await client.post(
-                    _ANTHROPIC_URL,
-                    headers=headers,
-                    json=payload,
-                )
-                response.raise_for_status()
-                data = response.json()
-        except httpx.TimeoutException as exc:
-            log.warning("llm.call.timeout", provider=self.name, timeout_s=self.timeout_s, request_id=request_id)
-            raise TimeoutError(f"Anthropic timeout after {self.timeout_s}s") from exc
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            body = exc.response.text[:500]
-            log.error("llm.call.http_error", provider=self.name, status_code=status, request_id=request_id)
-            if status == 401:
-                raise ProviderError("Anthropic authentication failed") from exc
-            if status == 429:
-                raise ProviderError("Anthropic rate limited") from exc
-            raise ProviderError(f"Anthropic HTTP {status}: {body}") from exc
-        except httpx.RequestError as exc:
-            log.warning("llm.call.connection_error", provider=self.name, request_id=request_id, error=str(exc))
-            raise ProviderError(f"Anthropic connection failed: {exc}") from exc
+        data = await with_retries(
+            lambda: post_json(
+                provider=self.name,
+                url=_ANTHROPIC_URL,
+                payload=payload,
+                headers=headers,
+                timeout_s=self.timeout_s,
+                transport=self._transport,
+                request_id=request_id,
+            ),
+            max_retries=self._max_retries,
+            wait_s=self._retry_wait_s,
+        )
 
-        elapsed = time.monotonic() - start
-        latency_ms = round(elapsed * 1000, 1)
-
-        text = ""
-        if data.get("content"):
-            for block in data["content"]:
-                if block.get("type") == "text":
-                    text += block.get("text", "")
-
-        tokens_in = data.get("usage", {}).get("input_tokens", 0)
-        tokens_out = data.get("usage", {}).get("output_tokens", 0)
-
-        # Rough cost estimate: Claude Sonnet ~$3/M in, ~$15/M out
-        cost_per_m_in = 3.0
-        cost_per_m_out = 15.0
-        cost_usd = (tokens_in / 1_000_000 * cost_per_m_in) + (tokens_out / 1_000_000 * cost_per_m_out)
+        latency_ms = round((time.monotonic() - start) * 1000, 1)
+        text = "".join(block.get("text", "") for block in data.get("content") or [] if block.get("type") == "text")
+        tokens_in = int(data.get("usage", {}).get("input_tokens", 0))
+        tokens_out = int(data.get("usage", {}).get("output_tokens", 0))
+        cost_usd = tokens_in / 1_000_000 * self._cost_per_m_in + tokens_out / 1_000_000 * self._cost_per_m_out
 
         log.info(
             "llm.call.ok",

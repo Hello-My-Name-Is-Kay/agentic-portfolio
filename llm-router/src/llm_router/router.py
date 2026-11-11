@@ -7,15 +7,17 @@ observability.
 
 from __future__ import annotations
 
-from llm_router.logging import get_logger
-import time
-from typing import Any
+import dataclasses
+from typing import TYPE_CHECKING
 
 from llm_router.budget import Budget
 from llm_router.cache import ResponseCache
 from llm_router.config import RouterSettings
-from llm_router.errors import AllProvidersFailed, BudgetExceeded, ProviderError
-from llm_router.models import LLMResponse, Provider
+from llm_router.errors import AllProvidersFailedError, BudgetExceededError, ProviderError
+from llm_router.logging import get_logger
+
+if TYPE_CHECKING:
+    from llm_router.models import LLMResponse, Provider
 
 log = get_logger(__name__)
 
@@ -35,6 +37,7 @@ class Router:
         budget: Budget | None = None,
         settings: RouterSettings | None = None,
     ) -> None:
+        """Build a router over ``providers`` (tried in order)."""
         config = settings or RouterSettings()
         self._providers = providers or []
         self._cache = cache or ResponseCache(
@@ -48,10 +51,10 @@ class Router:
         )
 
         log.info(
-            "Router initialized with %d providers, cache.ttl=%ds, budget.max_cost=%.2f",
-            len(self._providers),
-            config.cache_ttl_s,
-            config.max_cost_usd,
+            "router.initialized",
+            providers=[p.name for p in self._providers],
+            cache_ttl_s=config.cache_ttl_s,
+            max_cost_usd=config.max_cost_usd,
         )
 
     async def generate(self, prompt: str, request_id: str | None = None) -> LLMResponse:
@@ -62,11 +65,13 @@ class Router:
             request_id: Optional correlation ID for tracing.
 
         Returns:
-            LLMResponse from the first provider that succeeds.
+            LLMResponse from the first provider that succeeds, or a cached one (``cached=True``).
 
         Raises:
-            AllProvidersFailed: If every provider in the chain fails.
-            BudgetExceeded: If the budget is exceeded.
+            ProviderError: If the prompt is empty.
+            BudgetExceededError: If the budget is already used up (no provider is called),
+                or this call pushed it over.
+            AllProvidersFailedError: If every provider in the chain fails.
         """
         if not prompt or not prompt.strip():
             raise ProviderError("Cannot generate with empty prompt")
@@ -76,7 +81,9 @@ class Router:
             cached = self._cache.get(provider.name, provider.model, prompt)
             if cached is not None:
                 log.info("llm.cache.hit", provider=provider.name, request_id=request_id)
-                return cached
+                return dataclasses.replace(cached, cached=True)
+
+        self._budget.ensure_available()
 
         errors: list[str] = []
         for provider in self._providers:
@@ -105,7 +112,7 @@ class Router:
 
             try:
                 self._budget.record(resp)
-            except BudgetExceeded:
+            except BudgetExceededError:
                 log.error("llm.budget.exceeded", request_id=request_id)
                 raise
 
@@ -113,7 +120,7 @@ class Router:
 
         # All providers failed
         log.error("llm.all_providers_failed", request_id=request_id, errors=errors)
-        raise AllProvidersFailed(errors=errors)
+        raise AllProvidersFailedError(errors=errors)
 
     @property
     def providers(self) -> list[Provider]:

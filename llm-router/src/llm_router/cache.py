@@ -7,11 +7,11 @@ redundant API calls for identical requests within the TTL window.
 from __future__ import annotations
 
 import hashlib
-import json
-from llm_router.logging import get_logger
 import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING
+
+from llm_router.logging import get_logger
 
 if TYPE_CHECKING:
     from llm_router.models import LLMResponse
@@ -27,6 +27,7 @@ class ResponseCache:
     """
 
     def __init__(self, ttl_s: int = 300, max_size: int = 1000) -> None:
+        """Create a cache; ``ttl_s=0`` disables caching."""
         if ttl_s < 0:
             raise ValueError("ttl_s must be non-negative")
         if max_size < 1:
@@ -34,13 +35,13 @@ class ResponseCache:
 
         self._ttl_s = ttl_s
         self._max_size = max_size
-        self._cache: OrderedDict[str, tuple[float, "LLMResponse"]] = OrderedDict()
+        self._cache: OrderedDict[str, tuple[float, LLMResponse]] = OrderedDict()
 
     def _make_key(self, provider: str, model: str, prompt: str) -> str:
         raw = f"{provider}::{model}::{prompt}"
         return hashlib.sha256(raw.encode()).hexdigest()
 
-    def get(self, provider: str, model: str, prompt: str) -> "LLMResponse | None":
+    def get(self, provider: str, model: str, prompt: str) -> LLMResponse | None:
         """Get a cached response if it exists and hasn't expired."""
         key = self._make_key(provider, model, prompt)
         entry = self._cache.get(key)
@@ -57,14 +58,15 @@ class ResponseCache:
         log.info("cache.hit", provider=provider, model=model)
         return response
 
-    def set(self, provider: str, model: str, prompt: str, response: "LLMResponse") -> None:
+    def set(self, provider: str, model: str, prompt: str, response: LLMResponse) -> None:
         """Cache a response."""
         if self._ttl_s <= 0:
             return  # TTL of 0 disables caching
 
         key = self._make_key(provider, model, prompt)
+        self._cache.pop(key, None)
 
-        # Evict oldest if over max size
+        # Evict least recently used entries to make room
         while len(self._cache) >= self._max_size:
             self._cache.popitem(last=False)
 
@@ -73,8 +75,9 @@ class ResponseCache:
     def clear(self) -> None:
         """Clear all cached entries."""
         self._cache.clear()
-        log.info("Cache cleared")
+        log.info("cache.cleared")
 
     @property
     def size(self) -> int:
+        """Number of entries currently stored."""
         return len(self._cache)

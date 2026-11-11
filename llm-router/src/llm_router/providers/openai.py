@@ -1,20 +1,17 @@
-"""OpenAI provider implementation.
-
-Calls the OpenAI Chat Completions API with retry logic, timeout,
-and structured logging.
-"""
+"""OpenAI provider (Chat Completions API)."""
 
 from __future__ import annotations
 
-from llm_router.logging import get_logger
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from llm_router.errors import ProviderError
+from llm_router.logging import get_logger
+from llm_router.models import LLMResponse
+from llm_router.providers._http import post_json, with_retries
 
-from llm_router.errors import ProviderError, TimeoutError
-from llm_router.models import LLMResponse, Provider
+if TYPE_CHECKING:
+    import httpx
 
 log = get_logger(__name__)
 
@@ -31,7 +28,23 @@ class OpenAIProvider:
         model: str = "gpt-4o-mini",
         timeout_s: float = 30.0,
         max_retries: int = 3,
+        retry_wait_s: float = 0.5,
+        cost_per_m_in: float = 0.15,
+        cost_per_m_out: float = 0.60,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        """Configure the provider.
+
+        Args:
+            api_key: OpenAI API key.
+            model: Model ID.
+            timeout_s: Per-request timeout in seconds.
+            max_retries: Retries after the first attempt for transient errors (timeouts, 429, 5xx, connection).
+            retry_wait_s: Backoff multiplier in seconds (exponential, capped at 4s).
+            cost_per_m_in: USD per million input tokens, used for the cost estimate.
+            cost_per_m_out: USD per million output tokens, used for the cost estimate.
+            transport: Optional httpx transport (tests use a mock transport).
+        """
         if not api_key:
             raise ProviderError("OpenAI API key is required")
 
@@ -40,28 +53,20 @@ class OpenAIProvider:
         self.timeout_s = timeout_s
         self._api_key = api_key
         self._max_retries = max_retries
+        self._retry_wait_s = retry_wait_s
+        self._cost_per_m_in = cost_per_m_in
+        self._cost_per_m_out = cost_per_m_out
+        self._transport = transport
 
         log.info("provider.configured", name=self.name, model=model, timeout_s=timeout_s)
 
-    @retry(
-        retry=retry_if_exception_type((TimeoutError, httpx.TimeoutException, httpx.TransportError)),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.5, max=4),
-        reraise=True,
-    )
     async def generate(self, prompt: str, request_id: str | None = None) -> LLMResponse:
         """Generate a response using OpenAI's API.
 
-        Args:
-            prompt: The input prompt.
-            request_id: Optional correlation ID.
-
-        Returns:
-            LLMResponse with generated text and metadata.
-
         Raises:
-            TimeoutError: If the API call times out.
-            ProviderError: For authentication, rate limiting, or server errors.
+            ProviderTimeoutError: If every attempt timed out.
+            RetryableProviderError: If transient errors persisted through all retries.
+            ProviderError: For empty prompts, authentication or other client errors.
         """
         if not prompt or not prompt.strip():
             raise ProviderError("Cannot generate with empty prompt")
@@ -70,7 +75,6 @@ class OpenAIProvider:
             "Authorization": f"Bearer {self._api_key}",
             "content-type": "application/json",
         }
-
         payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": 1024,
@@ -81,45 +85,27 @@ class OpenAIProvider:
         log.info("llm.call.start", provider=self.name, model=self.model, request_id=request_id, prompt_len=len(prompt))
         start = time.monotonic()
 
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
-                response = await client.post(
-                    _OPENAI_URL,
-                    headers=headers,
-                    json=payload,
-                )
-                response.raise_for_status()
-                data = response.json()
-        except httpx.TimeoutException as exc:
-            log.warning("llm.call.timeout", provider=self.name, timeout_s=self.timeout_s, request_id=request_id)
-            raise TimeoutError(f"OpenAI timeout after {self.timeout_s}s") from exc
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            body = exc.response.text[:500]
-            log.error("llm.call.http_error", provider=self.name, status_code=status, request_id=request_id)
-            if status == 401:
-                raise ProviderError("OpenAI authentication failed") from exc
-            if status == 429:
-                raise ProviderError("OpenAI rate limited") from exc
-            raise ProviderError(f"OpenAI HTTP {status}: {body}") from exc
-        except httpx.RequestError as exc:
-            log.warning("llm.call.connection_error", provider=self.name, request_id=request_id, error=str(exc))
-            raise ProviderError(f"OpenAI connection failed: {exc}") from exc
+        data = await with_retries(
+            lambda: post_json(
+                provider=self.name,
+                url=_OPENAI_URL,
+                payload=payload,
+                headers=headers,
+                timeout_s=self.timeout_s,
+                transport=self._transport,
+                request_id=request_id,
+            ),
+            max_retries=self._max_retries,
+            wait_s=self._retry_wait_s,
+        )
 
-        elapsed = time.monotonic() - start
-        latency_ms = round(elapsed * 1000, 1)
-
-        choice = data.get("choices", [{}])[0]
-        text = choice.get("message", {}).get("content", "")
-
+        latency_ms = round((time.monotonic() - start) * 1000, 1)
+        choices = data.get("choices") or [{}]
+        text = str(choices[0].get("message", {}).get("content") or "")
         usage = data.get("usage", {})
-        tokens_in = usage.get("prompt_tokens", 0)
-        tokens_out = usage.get("completion_tokens", 0)
-
-        # Rough cost: GPT-4o-mini ~$0.15/M in, $0.60/M out
-        cost_per_m_in = 0.15
-        cost_per_m_out = 0.60
-        cost_usd = (tokens_in / 1_000_000 * cost_per_m_in) + (tokens_out / 1_000_000 * cost_per_m_out)
+        tokens_in = int(usage.get("prompt_tokens", 0))
+        tokens_out = int(usage.get("completion_tokens", 0))
+        cost_usd = tokens_in / 1_000_000 * self._cost_per_m_in + tokens_out / 1_000_000 * self._cost_per_m_out
 
         log.info(
             "llm.call.ok",

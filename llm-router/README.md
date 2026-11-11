@@ -1,6 +1,6 @@
 # LLM Router
 
-> **TL;DR** — Multi-provider LLM router with fallback chain (Anthropic → OpenAI → Ollama). Per-provider timeouts, tenacity retry with exponential backoff, in-memory LRU response cache, token/cost budget enforcement, structured JSON logging on every call with provider/latency/tokens/cost. Proves fallback resilience with injected-failure tests.
+> **TL;DR** — Multi-provider LLM router with a fallback chain (Anthropic → OpenAI → Ollama). Per-provider timeouts, tenacity retries with exponential backoff for transient errors, an in-memory LRU response cache, token/cost budget enforcement, and structured JSON logs on every call. Fallback, retry and budget behaviour are tested with injected failures against mocked HTTP.
 
 > **Tags:** `llm-router`, `fallback-chain`, `provider-protocol`, `retry`, `response-cache`, `budget`, `structured-logging`, `resilience-testing`
 
@@ -8,7 +8,18 @@ Multi-provider LLM router with fallback chain, retry per provider, response cach
 
 ## Why This Exists
 
-The job posting explicitly names "multi-provider fallbacks" as a required skill. This repo delivers exactly that: a `Router.generate()` method that tries Claude, then OpenAI, then a local model, with per-provider timeouts, retry budgets, a response cache, and a hard cap on total attempts. Every call is logged with provider, latency, tokens, and cost — making every effect traceable.
+A production LLM feature should not go down because one provider is slow, rate-limited or out of credit. `Router.generate()` tries providers in order (for example Claude, then OpenAI, then a local model), retries transient failures within each provider, serves repeated prompts from a cache, and refuses further calls once a token or cost budget is used up. Every call is logged with provider, latency, tokens and estimated cost.
+
+## Behaviour
+
+| Concern | What the code does |
+|---------|--------------------|
+| Fallback | Providers are tried in list order; any `ProviderError` (or unexpected exception) moves on to the next. If all fail, `AllProvidersFailedError` lists each provider's error. |
+| Retry | Per provider, via tenacity: timeouts, connection errors, HTTP 429 and 5xx are retried `max_retries` times with exponential backoff (capped at 4s). 401 and other 4xx are not retried. |
+| Timeout | Per-provider `timeout_s` on every HTTP call. |
+| Cache | In-memory LRU keyed by provider + model + prompt, with TTL. Hits are returned with `cached=True` and cost nothing. |
+| Budget | Tracks tokens in/out and estimated cost. A call that pushes a total over its limit raises `BudgetExceededError` after the response is recorded; once a limit is reached, later calls are refused before any provider is called. |
+| Cost | An estimate from per-million-token rates passed to each provider (defaults are list prices at the time of writing; Ollama is 0). |
 
 ## Architecture
 
@@ -51,8 +62,10 @@ cp .env.example .env
 
 ### CLI Usage
 
+The CLI builds the chain from `ROUTER_*` settings: Anthropic and OpenAI are added when their API keys are set, and the local Ollama provider is always last. Logs go to stderr, so `--json` output on stdout is clean.
+
 ```bash
-# Human-readable output (calls the local Ollama provider)
+# Human-readable output
 python -m llm_router.cli "Hello!"
 
 # JSON output for LLM consumption
@@ -66,11 +79,13 @@ import asyncio
 from llm_router.router import Router
 from llm_router.providers import AnthropicProvider, OpenAIProvider, OllamaProvider
 
-router = Router(providers=[
-    AnthropicProvider(api_key="sk-ant-...", model="claude-sonnet-4-5"),
-    OpenAIProvider(api_key="sk-proj-...", model="gpt-4o-mini"),
-    OllamaProvider(base_url="http://localhost:11434", model="llama3.2"),
-])
+router = Router(
+    providers=[
+        AnthropicProvider(api_key="sk-ant-...", model="claude-sonnet-4-5"),
+        OpenAIProvider(api_key="sk-proj-...", model="gpt-4o-mini"),
+        OllamaProvider(base_url="http://localhost:11434", model="llama3.2"),
+    ]
+)
 
 resp = asyncio.run(router.generate("Hello!", request_id="demo-001"))
 print(f"[{resp.provider}] {resp.text}")
@@ -110,41 +125,23 @@ pytest --cov=src --cov-fail-under=80
 
 ### What the Tests Cover
 
-- **Happy path:** primary provider succeeds.
-- **Fallback:** primary fails → secondary succeeds.
-- **Full fallback chain:** primary + secondary fail → tertiary succeeds.
-- **All providers fail:** raises `AllProvidersFailed` with all error messages.
-- **Cache hit:** identical prompt returns cached response without calling any provider.
-- **Empty prompt guard:** raises `ProviderError`.
-- **Budget tracking:** token in/out and cost counters update correctly.
-- **Budget exceeded:** raises `BudgetExceeded` when over limit.
-- **Cache TTL:** expired entries are not returned.
-- **Cache max size:** LRU eviction works.
-- **Budget reset:** counters clear correctly.
+All tests run offline: providers are tested against `httpx.MockTransport`, the router against fake providers.
 
-## Intentional Omissions
+- **Fallback:** primary fails → secondary; primary + secondary fail → tertiary; all fail → `AllProvidersFailedError` with every message; unexpected exceptions also fall back.
+- **Retry:** 429/500/503 retried then succeed; timeouts retried `max_retries` times then raised; 401/400 not retried.
+- **Providers:** request URL, headers and payload for each API; response parsing, token counts and cost; invalid bodies.
+- **Cache:** hit returns `cached=True` without calling the provider; TTL expiry; LRU eviction order.
+- **Budget:** counters; each limit; calls refused before reaching a provider once the budget is spent.
+- **CLI:** chain built from settings; JSON and text output; error exit code.
 
-- No streaming support (MVP uses non-streaming for simplicity).
-- No cost-based routing (always tries primary first).
-- No dashboard or metrics endpoint (Prometheus integration planned).
-- No authentication or SSRF guardrails (handled in the deployment layer).
+## Not built yet
+
+- Streaming responses.
+- Cost- or latency-based routing (the order is fixed).
+- A metrics endpoint; observability is structured logs only.
+- A shared cache (the cache is per process, in memory).
 
 ## Related Repos
 
 - [rag-local](../rag-local) — RAG pipeline that uses the router for generation.
-- [eval-harness](../eval-harness) — Evaluates router behavior under failure scenarios.
-
-## Definition of Done Checklist
-
-- [x] All public functions have type hints; `mypy --strict src` passes.
-- [x] `ruff check .` and `ruff format --check .` pass.
-- [x] Every except block logs with context and raises typed exceptions.
-- [x] Every external call has timeout and retry policy (tenacity).
-- [x] Every LLM call logs provider, latency, tokens, and cost.
-- [x] Every failure branch has a corresponding test.
-- [x] `pytest --cov=src --cov-fail-under=80` passes.
-- [x] README documents results and usage.
-- [x] CHANGELOG.md has an entry.
-- [x] No secrets, no print, no commented-out code, no TODO.
-- [x] Configuration via pydantic-settings with `.env.example`.
-- [x] Provider Protocol pattern for testable seams.
+- [eval-harness](../eval-harness) — golden-dataset evaluation that a router-backed pipeline can be scored with.
