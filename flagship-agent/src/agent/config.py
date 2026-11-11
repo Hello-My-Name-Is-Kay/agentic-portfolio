@@ -1,28 +1,18 @@
-"""Configuration for the flagship agent."""
+"""Configuration for the flagship agent, read from ``AGENT_*`` environment variables."""
 
 from __future__ import annotations
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class AgentSettings(BaseSettings):
-    """Agent configuration from environment variables."""
+    """Agent configuration."""
 
-    # --- API endpoints ---
     booking_api_base: str = "http://localhost:8000"
     booking_api_key: str = ""
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3.2"
 
-    # --- Agent limits ---
-    max_steps: int = 12
-    recursion_limit: int = 25
+    max_steps: int = 12  # user turns per conversation before handing off to a human
+    max_auth_failures: int = 3
+    recursion_limit: int = 25  # LangGraph super-step limit for a single turn
 
-    # --- Step-up auth ---
-    step_up_required_for: list[str] = ["change_reservation", "cancel_reservation"]
-
-    # --- Generation ---
-    llm_timeout_s: int = 30
-    llm_temperature: float = 0.1
-
-    model_config = {"env_file": ".env", "extra": "forbid", "env_prefix": "AGENT_"}
+    model_config = SettingsConfigDict(env_file=".env", extra="forbid", env_prefix="AGENT_")

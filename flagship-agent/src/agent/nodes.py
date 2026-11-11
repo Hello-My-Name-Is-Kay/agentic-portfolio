@@ -1,303 +1,275 @@
-"""Agent graph nodes — the LangGraph nodes that form the agent loop.
+"""LangGraph nodes and routing functions.
 
-Nodes:
-  - authenticate: Identify and verify the customer.
-  - classify_intent: Determine what the user wants to do.
-  - execute_tool: Run the appropriate tool based on intent.
-  - check_auth: Step-up auth for write operations.
-  - respond: Generate a natural language response.
-  - should_continue: Conditional edge routing.
+One graph invocation handles one user turn:
+
+    start_turn → authenticate → classify_intent → (route) → one reply node → END
+
+Intent classification is keyword-based so behaviour is deterministic in tests;
+``classify`` is the single place to swap in an LLM classifier.
 """
 
-from __future__ import annotations
-
 import json
-from agent.logging import get_logger
-from typing import Literal
+import re
+from typing import Any, Literal
 
 from agent.config import AgentSettings
-from agent.errors import HandoffRequired, MaxStepsExceeded
-from agent.state import AgentState, AuthLevel, Intent
+from agent.logging import get_logger
+from agent.state import ACCOUNT_INTENTS, WRITE_INTENTS, AgentState, Intent, Message, PendingAction, ToolCall
 from agent.tools import AgentTools
 
 log = get_logger(__name__)
 
+_CUSTOMER_ID = re.compile(r"\bC-\d{5}\b")
+_PIN = re.compile(r"(?<![\d-])\d{4}(?![\d-])")
+_RESERVATION_ID = re.compile(r"\bR-\d{5}\b")
+_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 
-# ─── Node Implementations ──────────────────────────────────────────
+_HANDOFF = re.compile(r"\b(human|real person|manager|supervisor|talk to|speak to|operator)\b")
+_POLICY = re.compile(r"\b(policy|policies|rules?|fees?|what is|what's|how does|how do|can i|tell me about)\b")
+_CANCEL = re.compile(r"\bcancel\b")
+_CHANGE = re.compile(r"\b(change|extend|reschedule|move|modify|postpone)\b")
+_LOOKUP = re.compile(r"\b(look ?up|check|status|details|find|my reservation|reservation)\b")
+_GREETING = re.compile(r"\b(hello|hi|hey|good (morning|afternoon|evening))\b")
 
-async def authenticate_node(state: AgentState, tools: AgentTools) -> AgentState:
-    """Authenticate the customer.
+_TRANSFER = "I'm transferring you to a colleague now."
 
-    If already verified, skip. Otherwise ask for ID.
-    """
-    log.info("node.authenticate", request_id=state.request_id)
-
-    if state.auth_level.value >= AuthLevel.VERIFIED.value:
-        return state
-
-    # Look for customer ID in the last user message
-    last_user_msg = ""
-    for msg in reversed(state.messages):
-        if msg.role == "user":
-            last_user_msg = msg.content
-            break
-
-    # Check if message contains authentication info
-    import re
-    cid_match = re.search(r'C-\d{5}', last_user_msg)
-    pin_match = re.search(r'\b\d{4}\b', last_user_msg)
-
-    if cid_match and pin_match:
-        cid = cid_match.group()
-        pin = pin_match.group()
-        result = await tools.authenticate(cid, pin)
-        data = json.loads(result)
-        if data["status"] == "ok":
-            customer = data["customer"]
-            state = state.with_auth(AuthLevel.VERIFIED, cid, customer["name"])
-            state = state.add_message("system", f"Authenticated as {customer['name']} ({cid}).")
-            log.info("node.authenticate.ok", customer_id=cid, name=customer["name"])
-            return state
-
-    # Not authenticated yet — prompt for credentials
-    state = state.add_message(
-        "assistant",
-        "Welcome to Rent-A-Car support! To help you, I need to verify your identity first.\n"
-        "Please provide your Customer ID (e.g., C-00001) and your 4-digit PIN."
-    )
-    return state
+StateUpdate = dict[str, Any]
 
 
-async def classify_intent_node(state: AgentState, tools: AgentTools) -> AgentState:
-    """Classify the user's intent from their message."""
-    log.info("node.classify_intent", request_id=state.request_id)
-
-    last_user_msg = ""
-    for msg in reversed(state.messages):
-        if msg.role == "user":
-            last_user_msg = msg.content.lower()
-            break
-
-    if not last_user_msg:
-        return state
-
-    if state.intent != Intent.UNKNOWN:
-        return state  # Already classified
-
-    intent = Intent.UNKNOWN
-    # Simple keyword-based classification (in prod, LLM-based)
-    if any(w in last_user_msg for w in ["hello", "hi ", "hey", "help"]):
-        intent = Intent.HANDSHAKE
-    elif any(w in last_user_msg for w in ["lookup", "find", "check", "get", "status", "my reservation"]):
-        intent = Intent.LOOKUP
-    elif any(w in last_user_msg for w in ["change", "move", "reschedule", "later", "extend", "modify"]):
-        intent = Intent.CHANGE
-    elif any(w in last_user_msg for w in ["cancel", "stop", "end"]):
-        intent = Intent.CANCEL
-    elif any(w in last_user_msg for w in ["policy", "rule", "what is", "how does", "can i", "tell me about"]):
-        intent = Intent.POLICY
-    elif any(w in last_user_msg for w in ["human", "agent", "manager", "talk to", "speak to"]):
-        intent = Intent.HANDOFF
-    elif "reservation" in last_user_msg:
-        intent = Intent.LOOKUP
-
-    state = state.with_intent(intent)
-    log.info("node.classify_intent.result", intent=intent.value)
-    return state
-
-
-async def execute_tool_node(state: AgentState, tools: AgentTools) -> AgentState:
-    """Execute the appropriate tool based on classified intent."""
-    log.info("node.execute_tool", intent=state.intent.value, request_id=state.request_id)
-
-    if state.intent == Intent.LOOKUP:
-        # Extract reservation ID from messages
-        import re
-        rid = state.reservation_id
-        if not rid:
-            for msg in state.messages:
-                m = re.search(r'R-\d{5}', msg.content)
-                if m:
-                    rid = m.group()
-                    break
-
-        if rid:
-            result = await tools.lookup_reservation(rid)
-            state = state.add_tool_call("lookup_reservation", {"reservation_id": rid}, result)
-            data = json.loads(result)
-            if data["status"] == "ok":
-                res = data["reservation"]
-                state = state.add_message("system",
-                    f"Reservation {rid}: {res.get('vehicle_category', 'N/A')}, "
-                    f"pickup {res.get('pickup_date', 'N/A')}, "
-                    f"return {res.get('return_date', 'N/A')}, "
-                    f"status: {res.get('status', 'N/A')}.")
-            else:
-                state = state.add_message("system", f"Could not find reservation {rid}.")
-        else:
-            state = state.add_message("assistant", "I need a reservation ID to look up. Could you provide it?")
-
-    elif state.intent == Intent.CHANGE:
-        if state.auth_level != AuthLevel.STEP_UP:
-            state = state.add_message("assistant",
-                "For security, I need to verify your identity first. Please confirm your Customer ID and PIN again to authorize changes.")
-            return state
-
-        import re
-        rid = state.reservation_id
-        if not rid:
-            for msg in state.messages:
-                m = re.search(r'R-\d{5}', msg.content)
-                if m:
-                    rid = m.group()
-                    break
-
-        if rid:
-            # Find a date in messages
-            date_match = None
-            for msg in state.messages:
-                m = re.search(r'\d{4}-\d{2}-\d{2}', msg.content)
-                if m:
-                    date_match = m.group()
-                    break
-
-            if date_match:
-                result = await tools.change_reservation(rid, date_match)
-                state = state.add_tool_call("change_reservation",
-                    {"reservation_id": rid, "new_dropoff_date": date_match}, result)
-                data = json.loads(result)
-                if data["status"] == "ok":
-                    state = state.add_message("system", f"Reservation {rid} updated to return on {date_match}.")
-                else:
-                    state = state.add_message("system",
-                        f"Could not change reservation: {data.get('reason', 'Unknown error')}.")
-            else:
-                state = state.add_message("assistant", "What date would you like to change the return to?")
-        else:
-            state = state.add_message("assistant", "Which reservation would you like to change?")
-
-    elif state.intent == Intent.CANCEL:
-        if state.auth_level != AuthLevel.STEP_UP:
-            state = state.add_message("assistant",
-                "For security, I need to verify your identity first. Please confirm your Customer ID and PIN again to authorize cancellation.")
-            return state
-
-        import re
-        rid = state.reservation_id
-        if not rid:
-            for msg in state.messages:
-                m = re.search(r'R-\d{5}', msg.content)
-                if m:
-                    rid = m.group()
-                    break
-
-        if rid:
-            result = await tools.cancel_reservation(rid, "Requested by customer")
-            state = state.add_tool_call("cancel_reservation", {"reservation_id": rid}, result)
-            data = json.loads(result)
-            if data["status"] == "ok":
-                state = state.add_message("system", f"Reservation {rid} has been cancelled.")
-            else:
-                state = state.add_message("system",
-                    f"Could not cancel: {data.get('reason', 'Unknown error')}.")
-        else:
-            state = state.add_message("assistant", "Which reservation would you like to cancel?")
-
-    elif state.intent == Intent.POLICY:
-        last_msg = ""
-        for msg in reversed(state.messages):
-            if msg.role == "user":
-                last_msg = msg.content
-                break
-        result = await tools.ask_policy(last_msg)
-        state = state.add_tool_call("ask_policy", {"question": last_msg}, result)
-        data = json.loads(result)
-        answer = data.get("answer", "I don't know based on the available policies.")
-        state = state.add_message("system", answer)
-
-    elif state.intent == Intent.HANDSHAKE:
-        state = state.add_message("assistant",
-            "Hello! I'm the Rent-A-Car assistant. How can I help you today? "
-            "I can look up reservations, change dates, cancel bookings, or answer policy questions.")
-
-    elif state.intent == Intent.HANDOFF:
-        state = state.with_handoff("Customer requested human agent.")
-
-    elif state.intent == Intent.UNKNOWN:
-        state = state.add_message("assistant",
-            "I'm not sure I understand. I can help with: looking up reservations, "
-            "changing or cancelling bookings, and answering policy questions. "
-            "What would you like help with?")
-
-    return state
-
-
-async def step_up_auth_node(state: AgentState, tools: AgentTools) -> AgentState:
-    """Step-up authentication for write operations (change/cancel)."""
-    log.info("node.step_up_auth", request_id=state.request_id, auth_level=state.auth_level.value)
-
-    if state.intent in (Intent.CHANGE, Intent.CANCEL):
-        if state.auth_level == AuthLevel.VERIFIED:
-            # Prompt for re-verification
-            state = state.add_message("assistant",
-                "To process this request, I need you to confirm your identity. "
-                "Please re-enter your Customer ID and PIN for authorization.")
-            return state
-
-        if state.auth_level == AuthLevel.STEP_UP:
-            return state  # Already step-up authed
-
-    return state
-
-
-async def respond_node(state: AgentState, config: AgentSettings) -> AgentState:
-    """Generate the final response (currently just relays system messages).
-
-    In production, this would call an LLM to generate natural language
-    from the tool results and system messages.
-    """
-    log.info("node.respond", request_id=state.request_id)
-
-    if state.handoff_reason:
-        state = state.add_message("assistant",
-            f"I'm transferring you to a human agent now. Reason: {state.handoff_reason}\n"
-            "Thank you for your patience.")
-        return state
-
-    # Relay the last system message as the response
-    last_system = ""
-    for msg in reversed(state.messages):
-        if msg.role == "system" and msg.content:
-            last_system = msg.content
-            break
-
-    if not last_system:
-        last_user = ""
-        for msg in reversed(state.messages):
-            if msg.role == "assistant" and msg.content:
-                last_user = msg.content
-                break
-        if not last_user:
-            state = state.add_message("assistant", "How can I help you with your rental today?")
-
-    return state
-
-
-def should_continue(state: AgentState, config: AgentSettings) -> Literal["tools", "handoff", "__end__"]:
-    """Determine the next step in the agent graph."""
-    log.info("node.should_continue", request_id=state.request_id, step=state.step_count, max=config.max_steps)
-
-    # Check max steps
-    if state.step_count >= config.max_steps:
-        log.warning("agent.loop_limit_reached", steps=state.step_count, request_id=state.request_id)
+def classify(text: str) -> Intent:
+    """Map a user message to an intent."""
+    t = text.lower()
+    has_reservation = bool(_RESERVATION_ID.search(text))
+    if _HANDOFF.search(t):
         return "handoff"
+    if _POLICY.search(t) and not has_reservation:
+        return "policy"
+    if _CANCEL.search(t):
+        return "cancel"
+    if _CHANGE.search(t):
+        return "change"
+    if _LOOKUP.search(t) or has_reservation:
+        return "lookup"
+    if _GREETING.search(t):
+        return "greeting"
+    return "unknown"
 
-    # Check handoff
-    if state.handoff_reason:
+
+def _last_user_text(state: AgentState) -> str:
+    return next((m["content"] for m in reversed(state["messages"]) if m["role"] == "user"), "")
+
+
+def _say(text: str) -> StateUpdate:
+    return {"messages": [Message(role="assistant", content=text)]}
+
+
+def _call(name: str, args: dict[str, str], raw: str) -> tuple[dict[str, Any], ToolCall]:
+    result: dict[str, Any] = json.loads(raw)
+    return result, ToolCall(name=name, args=args, result=result)
+
+
+class Nodes:
+    """Graph nodes bound to one set of tools and settings."""
+
+    def __init__(self, tools: AgentTools, settings: AgentSettings) -> None:
+        """Bind the nodes to the tools and limits they use."""
+        self._tools = tools
+        self._settings = settings
+
+    async def start_turn(self, state: AgentState) -> StateUpdate:
+        """Count the turn and hand off once the conversation runs too long."""
+        turn = state["turn"] + 1
+        update: StateUpdate = {"turn": turn}
+        if turn > self._settings.max_steps and not state["handoff_reason"]:
+            update["handoff_reason"] = f"Conversation exceeded {self._settings.max_steps} turns."
+        log.info("node.start_turn", turn=turn)
+        return update
+
+    async def authenticate(self, state: AgentState) -> StateUpdate:
+        """Verify credentials found in the message; credentials sent while a write is pending grant step-up."""
+        text = _last_user_text(state)
+        cid, pin = _CUSTOMER_ID.search(text), _PIN.search(text)
+        if not (cid and pin):
+            return {}
+        customer_id = cid.group()
+        result, call = _call(
+            "authenticate", {"customer_id": customer_id}, await self._tools.authenticate(customer_id, pin.group())
+        )
+        update: StateUpdate = {"tool_trace": [call]}
+        if result["status"] != "ok":
+            failed = state["failed_auth"] + 1
+            update |= {"failed_auth": failed, "auth_fail_turn": state["turn"], "errors": [result["reason"]]}
+            if failed >= self._settings.max_auth_failures:
+                update["handoff_reason"] = "Too many failed authentication attempts."
+            log.info("node.authenticate.failed", customer_id=customer_id, failed=failed)
+            return update
+        pending = state["pending"]
+        write_pending = pending is not None and pending["intent"] in WRITE_INTENTS
+        level = "step_up" if write_pending else "verified"
+        log.info("node.authenticate.ok", customer_id=customer_id, level=level)
+        return update | {
+            "auth_level": level,
+            "customer_id": customer_id,
+            "customer_name": result["customer"]["name"],
+            "failed_auth": 0,
+            "auth_ok_turn": state["turn"],
+        }
+
+    async def classify_intent(self, state: AgentState) -> StateUpdate:
+        """Classify the turn and keep the account action it refers to in ``pending``."""
+        text = _last_user_text(state)
+        intent = classify(text)
+        pending = state["pending"]
+        rid = _RESERVATION_ID.search(text)
+        date = _DATE.search(text)
+        reservation_id = rid.group() if rid else None
+        new_date = date.group() if date else None
+
+        keywords_only = classify(_DATE.sub(" ", _RESERVATION_ID.sub(" ", text)))
+        if keywords_only in ("unknown", "greeting") and pending is not None:
+            auth_attempt_now = state["turn"] in (state["auth_ok_turn"], state["auth_fail_turn"])
+            if auth_attempt_now or reservation_id or new_date:
+                intent = pending["intent"]
+
+        update: StateUpdate = {"intent": intent}
+        if intent in ACCOUNT_INTENTS:
+            same_action = pending is not None and pending["intent"] == intent
+            update["pending"] = PendingAction(
+                intent=intent,
+                reservation_id=reservation_id or (pending["reservation_id"] if same_action and pending else None),
+                new_dropoff_date=new_date or (pending["new_dropoff_date"] if same_action and pending else None),
+            )
+        log.info("node.classify_intent", intent=intent)
+        return update
+
+    async def answer_policy(self, state: AgentState) -> StateUpdate:
+        """Answer a policy question; no authentication needed."""
+        question = _last_user_text(state)
+        result, call = _call("ask_policy", {"question": question}, await self._tools.ask_policy(question))
+        return {"tool_trace": [call]} | _say(result["answer"])
+
+    async def run_account_tool(self, state: AgentState) -> StateUpdate:
+        """Look up the reservation, check it belongs to the customer, then read or write it."""
+        pending = state["pending"]
+        assert pending is not None and pending["reservation_id"] is not None
+        rid = pending["reservation_id"]
+        result, lookup = _call("lookup_reservation", {"reservation_id": rid}, await self._tools.lookup_reservation(rid))
+        update: StateUpdate = {"pending": None, "tool_trace": [lookup]}
+        if pending["intent"] in WRITE_INTENTS:
+            update["auth_level"] = "verified"  # step-up is single-use
+
+        if result["status"] != "ok":
+            update["errors"] = [result["reason"]]
+            if result["code"] == "NOT_FOUND":
+                return update | _say(f"I couldn't find reservation {rid} on your account. Could you check the ID?")
+            return update | _say("Our booking system isn't responding right now. Please try again in a few minutes.")
+
+        res = result["reservation"]
+        if res.get("customer_id") != state["customer_id"]:
+            update["errors"] = [f"Reservation {rid} does not belong to {state['customer_id']}."]
+            return update | _say(f"I couldn't find reservation {rid} on your account. Could you check the ID?")
+
+        if pending["intent"] == "lookup":
+            return update | _say(
+                f"Reservation {rid}: {res.get('vehicle_category', 'vehicle')}, pickup {res.get('pickup_date')}, "
+                f"return {res.get('return_date')}, status {res.get('status')}."
+            )
+
+        if pending["intent"] == "change":
+            new_date = pending["new_dropoff_date"]
+            assert new_date is not None
+            args = {"reservation_id": rid, "new_dropoff_date": new_date}
+            write, call = _call("change_reservation", args, await self._tools.change_reservation(rid, new_date))
+            done = f"Done — reservation {rid} now returns on {new_date}."
+        else:
+            args = {"reservation_id": rid}
+            write, call = _call(
+                "cancel_reservation", args, await self._tools.cancel_reservation(rid, "Customer request")
+            )
+            done = f"Done — reservation {rid} has been cancelled."
+
+        update["tool_trace"] = [lookup, call]
+        if write["status"] == "ok":
+            return update | _say(done)
+        update["errors"] = [write["reason"]]
+        return update | _say(f"I couldn't complete that: {write['reason']}")
+
+    async def request_auth(self, state: AgentState) -> StateUpdate:
+        """Ask for credentials before any account action."""
+        prefix = "Those details didn't match. " if state["auth_fail_turn"] == state["turn"] else ""
+        return _say(
+            f"{prefix}To help with your reservation I need to verify you first. "
+            "Please send your Customer ID (e.g. C-00001) and your 4-digit PIN."
+        )
+
+    async def request_step_up(self, state: AgentState) -> StateUpdate:
+        """Ask the customer to re-confirm credentials before a write."""
+        prefix = "Those details didn't match. " if state["auth_fail_turn"] == state["turn"] else ""
+        action = "change" if state["intent"] == "change" else "cancel"
+        return _say(
+            f"{prefix}For your security, please confirm your Customer ID and PIN again to {action} this reservation."
+        )
+
+    async def ask_details(self, state: AgentState) -> StateUpdate:
+        """Ask for the reservation ID or new date the action still needs."""
+        pending = state["pending"]
+        assert pending is not None
+        if pending["reservation_id"] is None:
+            return _say("Which reservation is this about? Please send the ID, e.g. R-00001.")
+        return _say("What new return date would you like? Please use the format YYYY-MM-DD.")
+
+    async def greet(self, state: AgentState) -> StateUpdate:
+        """Greet, or confirm a successful verification."""
+        if state["auth_ok_turn"] == state["turn"]:
+            return _say(f"Thanks, {state['customer_name']} — you're verified. How can I help with your rental?")
+        return _say("Hello! I can look up, change or cancel a reservation, or answer questions about our policies.")
+
+    async def clarify(self, state: AgentState) -> StateUpdate:  # noqa: ARG002
+        """Ask the customer to rephrase."""
+        return _say(
+            "Sorry, I didn't catch that. I can look up, change or cancel a reservation, "
+            "or answer policy questions. What would you like to do?"
+        )
+
+    async def handoff(self, state: AgentState) -> StateUpdate:
+        """Transfer to a human colleague; later turns just confirm the transfer."""
+        already = any(m["role"] == "assistant" and m["content"].startswith(_TRANSFER) for m in state["messages"])
+        if already:
+            return _say("You're already being transferred to a colleague. Thank you for your patience.")
+        reason = state["handoff_reason"] or "Customer asked for a human agent."
+        log.info("node.handoff", reason=reason)
+        return {"handoff_reason": reason} | _say(f"{_TRANSFER} Reason: {reason}")
+
+
+def route_start(state: AgentState) -> Literal["handoff", "authenticate"]:
+    """Skip straight to handoff once a conversation is over its limit."""
+    return "handoff" if state["handoff_reason"] else "authenticate"
+
+
+def route_intent(
+    state: AgentState,
+) -> Literal[
+    "handoff", "answer_policy", "request_auth", "ask_details", "request_step_up", "run_account_tool", "greet", "clarify"
+]:
+    """Pick the reply node for this turn."""
+    intent = state["intent"]
+    if state["handoff_reason"] or intent == "handoff":
         return "handoff"
-
-    # Check if we need to execute a tool
-    if state.intent in (Intent.LOOKUP, Intent.CHANGE, Intent.CANCEL, Intent.POLICY):
-        return "tools"
-
-    return "__end__"
+    if intent == "policy":
+        return "answer_policy"
+    if intent in ACCOUNT_INTENTS:
+        pending = state["pending"]
+        if state["auth_level"] == "none":
+            return "request_auth"
+        if pending is None or pending["reservation_id"] is None:
+            return "ask_details"
+        if intent == "change" and pending["new_dropoff_date"] is None:
+            return "ask_details"
+        if intent in WRITE_INTENTS and state["auth_level"] != "step_up":
+            return "request_step_up"
+        return "run_account_tool"
+    if state["auth_fail_turn"] == state["turn"]:
+        return "request_auth"
+    if intent == "greeting" or state["auth_ok_turn"] == state["turn"]:
+        return "greet"
+    return "clarify"

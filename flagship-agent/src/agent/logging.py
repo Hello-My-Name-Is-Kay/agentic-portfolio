@@ -1,14 +1,14 @@
-"""Structured logging setup for the agent.
-
-Every log line includes request_id and agent_step for traceability.
-"""
+"""Structured JSON logging; ``request_id`` and ``thread_id`` are bound per turn."""
 
 from __future__ import annotations
+
+from typing import cast
 
 import structlog
 
 
 def configure_logging(log_level: str = "INFO") -> None:
+    """Emit one JSON object per log line."""
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
@@ -21,5 +21,6 @@ def configure_logging(log_level: str = "INFO") -> None:
     )
 
 
-def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
-    return structlog.get_logger(name or __name__)
+def get_logger(name: str | None = None) -> structlog.typing.FilteringBoundLogger:
+    """Return a module logger."""
+    return cast("structlog.typing.FilteringBoundLogger", structlog.get_logger(name or __name__))

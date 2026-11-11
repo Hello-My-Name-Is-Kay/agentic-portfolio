@@ -1,165 +1,72 @@
-"""Agent state model — tracks conversation, step count, and auth status.
+"""Graph state for the customer-service agent.
 
-Uses a frozen Pydantic model for immutability; state transitions
-create new state objects.
+Plain JSON-friendly types only, so every turn can be checkpointed per conversation thread.
+List fields use an ``operator.add`` reducer: nodes return new items and LangGraph appends them.
 """
 
-from __future__ import annotations
+import operator
+from typing import Annotated, Any, Literal, TypedDict
 
-import uuid
-from dataclasses import dataclass, field
-from datetime import datetime
-from enum import Enum
-from typing import Any
+AuthLevel = Literal["none", "verified", "step_up"]
+Intent = Literal["unknown", "greeting", "lookup", "change", "cancel", "policy", "handoff"]
 
-
-class AuthLevel(Enum):
-    """Authentication level for the current session."""
-    NONE = "none"
-    BASIC = "basic"  # Customer identified
-    VERIFIED = "verified"  # Customer authenticated (e.g., PIN verified)
-    STEP_UP = "step_up"  # Elevated auth for write operations
+ACCOUNT_INTENTS: frozenset[Intent] = frozenset({"lookup", "change", "cancel"})
+WRITE_INTENTS: frozenset[Intent] = frozenset({"change", "cancel"})
 
 
-class Intent(Enum):
-    """Classified intent of the user's request."""
-    UNKNOWN = "unknown"
-    LOOKUP = "lookup"  # Get reservation info
-    CHANGE = "change"  # Change reservation details
-    CANCEL = "cancel"  # Cancel a reservation
-    POLICY = "policy"  # Ask about policy
-    HANDSHAKE = "handshake"  # Greeting/identification
-    HANDOFF = "handoff"  # Request human agent
+class Message(TypedDict):
+    """One conversation message."""
 
-
-@dataclass
-class Message:
-    """A single message in the conversation."""
-    role: str  # "user" | "assistant" | "system" | "tool"
+    role: Literal["user", "assistant"]
     content: str
-    tool_name: str | None = None
-    tool_result: str | None = None
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
-@dataclass
-class AgentState:
-    """Immutable state of the agent at a point in time."""
+class ToolCall(TypedDict):
+    """One recorded tool call; ``args`` never contains secrets such as the PIN."""
 
-    request_id: str = field(default_factory=lambda: f"req-{uuid.uuid4().hex[:8]}")
-    customer_id: str | None = None
-    customer_name: str | None = None
-    auth_level: AuthLevel = AuthLevel.NONE
-    intent: Intent = Intent.UNKNOWN
-    step_count: int = 0
-    messages: list[Message] = field(default_factory=list)
-    tool_trace: list[dict] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
-    handoff_reason: str | None = None
-    reservation_id: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    name: str
+    args: dict[str, str]
+    result: dict[str, Any]
 
-    def add_message(self, role: str, content: str, tool_name: str | None = None, tool_result: str | None = None) -> "AgentState":
-        """Return a new state with an added message."""
-        msg = Message(
-            role=role,
-            content=content,
-            tool_name=tool_name,
-            tool_result=tool_result,
-        )
-        return AgentState(
-            request_id=self.request_id,
-            customer_id=self.customer_id,
-            customer_name=self.customer_name,
-            auth_level=self.auth_level,
-            intent=self.intent,
-            step_count=self.step_count + 1,
-            messages=self.messages + [msg],
-            tool_trace=list(self.tool_trace),
-            errors=list(self.errors),
-            handoff_reason=self.handoff_reason,
-            reservation_id=self.reservation_id,
-            metadata=dict(self.metadata),
-        )
 
-    def add_tool_call(self, name: str, args: dict, result: str) -> "AgentState":
-        """Record a tool call in the trace."""
-        return AgentState(
-            request_id=self.request_id,
-            customer_id=self.customer_id,
-            customer_name=self.customer_name,
-            auth_level=self.auth_level,
-            intent=self.intent,
-            step_count=self.step_count,
-            messages=list(self.messages),
-            tool_trace=self.tool_trace + [{"name": name, "args": args, "result": result}],
-            errors=list(self.errors),
-            handoff_reason=self.handoff_reason,
-            reservation_id=self.reservation_id,
-            metadata=dict(self.metadata),
-        )
+class PendingAction(TypedDict):
+    """An account action waiting for details or authentication."""
 
-    def with_auth(self, level: AuthLevel, customer_id: str | None = None, customer_name: str | None = None) -> "AgentState":
-        """Return a new state with updated auth level."""
-        return AgentState(
-            request_id=self.request_id,
-            customer_id=customer_id or self.customer_id,
-            customer_name=customer_name or self.customer_name,
-            auth_level=level,
-            intent=self.intent,
-            step_count=self.step_count,
-            messages=list(self.messages),
-            tool_trace=list(self.tool_trace),
-            errors=list(self.errors),
-            handoff_reason=self.handoff_reason,
-            reservation_id=self.reservation_id,
-            metadata=dict(self.metadata),
-        )
+    intent: Intent
+    reservation_id: str | None
+    new_dropoff_date: str | None
 
-    def with_intent(self, intent: Intent) -> "AgentState":
-        return AgentState(
-            request_id=self.request_id,
-            customer_id=self.customer_id,
-            customer_name=self.customer_name,
-            auth_level=self.auth_level,
-            intent=intent,
-            step_count=self.step_count,
-            messages=list(self.messages),
-            tool_trace=list(self.tool_trace),
-            errors=list(self.errors),
-            handoff_reason=self.handoff_reason,
-            reservation_id=self.reservation_id,
-            metadata=dict(self.metadata),
-        )
 
-    def with_error(self, error: str) -> "AgentState":
-        return AgentState(
-            request_id=self.request_id,
-            customer_id=self.customer_id,
-            customer_name=self.customer_name,
-            auth_level=self.auth_level,
-            intent=self.intent,
-            step_count=self.step_count,
-            messages=list(self.messages),
-            tool_trace=list(self.tool_trace),
-            errors=self.errors + [error],
-            handoff_reason=self.handoff_reason,
-            reservation_id=self.reservation_id,
-            metadata=dict(self.metadata),
-        )
+class AgentState(TypedDict):
+    """Full state of one conversation thread."""
 
-    def with_handoff(self, reason: str) -> "AgentState":
-        return AgentState(
-            request_id=self.request_id,
-            customer_id=self.customer_id,
-            customer_name=self.customer_name,
-            auth_level=self.auth_level,
-            intent=self.intent,
-            step_count=self.step_count,
-            messages=list(self.messages),
-            tool_trace=list(self.tool_trace),
-            errors=list(self.errors),
-            handoff_reason=reason,
-            reservation_id=self.reservation_id,
-            metadata=dict(self.metadata),
-        )
+    messages: Annotated[list[Message], operator.add]
+    tool_trace: Annotated[list[ToolCall], operator.add]
+    errors: Annotated[list[str], operator.add]
+    request_id: str
+    turn: int
+    customer_id: str | None
+    customer_name: str | None
+    auth_level: AuthLevel
+    failed_auth: int
+    auth_ok_turn: int
+    auth_fail_turn: int
+    intent: Intent
+    pending: PendingAction | None
+    handoff_reason: str | None
+
+
+def initial_state() -> dict[str, Any]:
+    """Return the values a brand-new conversation thread starts with."""
+    return {
+        "turn": 0,
+        "customer_id": None,
+        "customer_name": None,
+        "auth_level": "none",
+        "failed_auth": 0,
+        "auth_ok_turn": 0,
+        "auth_fail_turn": 0,
+        "intent": "unknown",
+        "pending": None,
+        "handoff_reason": None,
+    }

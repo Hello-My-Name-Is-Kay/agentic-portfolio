@@ -14,7 +14,7 @@ Each project is self-contained with its own tests, CI, documentation, and depend
 | 4 | **Mock Booking API** | FastAPI with OpenAPI, Pydantic, idempotency, API key auth | [mock-booking-api](mock-booking-api/) |
 | 5 | **MCP Server** | 3 booking tools with typed schemas, JSON error responses | [mcp-server](mcp-server/) |
 | 6 | **Guardrails Suite** | 33 attack cases, PII redaction, output validation, CI gate | [guardrails](guardrails/) |
-| 7 | **Flagship LangGraph Agent** | Customer service agent: auth → intent → tools → respond | [flagship-agent](flagship-agent/) |
+| 7 | **Flagship LangGraph Agent** | LangGraph `StateGraph` customer-service agent: auth, step-up for writes, ownership checks, handoff | [flagship-agent](flagship-agent/) |
 | 8 | **Ticket Automation Tool** | SQL ticket queue, idempotency, audit, fake data only | [ticket-tool](ticket-tool/) |
 
 ## Stack
