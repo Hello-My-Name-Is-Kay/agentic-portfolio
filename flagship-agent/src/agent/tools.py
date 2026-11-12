@@ -169,7 +169,7 @@ class AgentTools:
 
     async def ask_policy(self, question: str) -> str:
         """Answer a rental-policy question (keyword stand-in for the rag-local pipeline)."""
-        log.info("tool.ask_policy", question=question[:80])
+        log.info("tool.ask_policy", question_chars=len(question))
         q = question.lower()
         for key, answer in _POLICIES.items():
             if key in q:

@@ -1,0 +1,15 @@
+# AWS CodeBuild (ARM_CONTAINER, privileged) builds the ARM64 image natively and pushes it to ECR.
+# Env: ECR_REPOSITORY_URI, IMAGE_TAG.
+version: 0.2
+phases:
+  pre_build:
+    commands:
+      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${ECR_REPOSITORY_URI%%/*}"
+  build:
+    commands:
+      - docker build -f flagship-agent/deploy/Dockerfile -t "$ECR_REPOSITORY_URI:$IMAGE_TAG" -t "$ECR_REPOSITORY_URI:latest" .
+      - docker inspect --format '{{.Architecture}}' "$ECR_REPOSITORY_URI:$IMAGE_TAG"
+  post_build:
+    commands:
+      - docker push "$ECR_REPOSITORY_URI:$IMAGE_TAG"
+      - docker push "$ECR_REPOSITORY_URI:latest"

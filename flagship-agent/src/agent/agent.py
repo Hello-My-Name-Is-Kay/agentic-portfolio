@@ -51,11 +51,14 @@ class CustomerServiceAgent:
         graph = build_graph(self._tools, self._settings, classifier)
         self.graph = graph.compile(checkpointer=checkpointer or InMemorySaver())
 
-    async def run(self, user_input: str, thread_id: str = "default") -> AgentState:
-        """Process one user message in a conversation thread and return the thread's full state."""
+    async def run(self, user_input: str, thread_id: str = "default", actor_id: str = "customer") -> AgentState:
+        """Process one user message in a conversation thread and return the thread's full state.
+
+        ``actor_id`` is required by the AgentCore Memory checkpointer; the in-memory checkpointer ignores it.
+        """
         request_id = f"req-{uuid.uuid4().hex[:8]}"
         config: RunnableConfig = {
-            "configurable": {"thread_id": thread_id},
+            "configurable": {"thread_id": thread_id, "actor_id": actor_id},
             "recursion_limit": self._settings.recursion_limit,
         }
         with structlog.contextvars.bound_contextvars(request_id=request_id, thread_id=thread_id):
@@ -67,7 +70,7 @@ class CustomerServiceAgent:
                 "messages": [Message(role="user", content=screened.text)],
                 "guard_blocked": screened.blocked_by,
             }
-            log.info("agent.turn.start", input_preview=screened.text[:80])
+            log.info("agent.turn.start", input_chars=len(screened.text))  # never log message content
             state = cast("AgentState", await self.graph.ainvoke(cast("AgentState", update), config))
             log.info(
                 "agent.turn.end", turn=state["turn"], intent=state["intent"], handoff=bool(state["handoff_reason"])

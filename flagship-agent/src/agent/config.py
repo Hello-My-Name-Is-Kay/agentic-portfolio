@@ -25,4 +25,6 @@ class AgentSettings(BaseSettings):
     guardrail_id: str = ""  # Bedrock guardrail screening every message; empty = no screening
     guardrail_version: str = "1"  # always a pinned version, never DRAFT
 
+    memory_id: str = ""  # AgentCore Memory resource for checkpoints; empty = in-memory
+
     model_config = SettingsConfigDict(env_file=".env", extra="forbid", env_prefix="AGENT_")
