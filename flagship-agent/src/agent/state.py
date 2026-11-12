@@ -5,6 +5,7 @@ List fields use an ``operator.add`` reducer: nodes return new items and LangGrap
 """
 
 import operator
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal, TypedDict
 
 AuthLevel = Literal["none", "verified", "step_up"]
@@ -55,6 +56,13 @@ class AgentState(TypedDict):
     pending: PendingAction | None
     handoff_reason: str | None
     guard_blocked: str | None  # filters that blocked this turn's message, set before the graph runs
+
+
+@dataclass(frozen=True)
+class TurnContext:
+    """Per-turn values that must never be checkpointed (LangGraph runtime context, not state)."""
+
+    pin: str | None = None
 
 
 def initial_state() -> dict[str, Any]:

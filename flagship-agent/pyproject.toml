@@ -1,6 +1,6 @@
 [project]
 name = "flagship-agent"
-version = "0.4.1"
+version = "0.4.2"
 description = "LangGraph customer-service agent for car rental — flagship portfolio project"
 requires-python = ">=3.11"
 license = {text = "MIT"}

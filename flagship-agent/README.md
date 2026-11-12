@@ -1,6 +1,6 @@
 # Flagship Agent — Customer-Service Agent on LangGraph and Amazon Bedrock AgentCore
 
-> **TL;DR** — A car-rental customer-service agent built as a LangGraph `StateGraph` with per-conversation memory (checkpointer keyed by `thread_id`). It authenticates customers, looks up, changes and cancels reservations, answers policy questions, and hands off to a human. Every message is screened by Amazon Bedrock Guardrails first (personal data masked, prompt attacks refused), and intent is classified by Claude on Amazon Bedrock (structured output), with a deterministic keyword fallback. It is deployed on **Amazon Bedrock AgentCore Runtime** as an ARM64 container built by AWS CodeBuild, with conversation state in **AgentCore Memory**. Account actions require authentication, writes require single-use step-up re-authentication, every write carries an idempotency key, and customers can only touch their own reservations. 70 tests assert tool trajectories across multi-turn conversations without touching the network.
+> **TL;DR** — A car-rental customer-service agent built as a LangGraph `StateGraph` with per-conversation memory (checkpointer keyed by `thread_id`). It authenticates customers, looks up, changes and cancels reservations, answers policy questions, and hands off to a human. Every message is screened by Amazon Bedrock Guardrails first (personal data masked, prompt attacks refused), and intent is classified by Claude on Amazon Bedrock (structured output), with a deterministic keyword fallback. It is deployed on **Amazon Bedrock AgentCore Runtime** as an ARM64 container built by AWS CodeBuild, with conversation state in **AgentCore Memory**. Account actions require authentication, writes require single-use step-up re-authentication, every write carries an idempotency key, and customers can only touch their own reservations. 72 tests assert tool trajectories across multi-turn conversations without touching the network.
 
 > **Tags:** `langgraph`, `stategraph`, `checkpointer`, `amazon-bedrock`, `bedrock-guardrails`, `agentcore-runtime`, `agentcore-memory`, `claude`, `docker`, `tool-calling`, `step-up-auth`, `idempotency`, `handoff`, `tool-trajectory`
 
@@ -138,7 +138,7 @@ Logs record message length, never content (a test asserts the PIN and message te
 ## Tests
 
 ```bash
-pytest            # 70 tests, no network or AWS needed; coverage gate 80% (currently 97%)
+pytest            # 72 tests, no network or AWS needed; coverage gate 80% (currently 97%)
 ruff check . && ruff format --check . && mypy --strict src
 ```
 
@@ -152,6 +152,7 @@ The tests run the real tool code against an in-memory fake of the booking API (`
 - API outage, unknown reservation and failed writes reported to the customer
 - handoff on request, after three failed logins and after the turn limit
 - conversation threads isolated from each other; the PIN never appears in the tool trace or the model prompt
+- the PIN authenticates through LangGraph's runtime context and is never stored: messages keep `[PIN]`, and the checkpointer never sees it
 - a model tricked into "cancel" still cannot write without authentication and step-up
 - Bedrock errors and malformed model answers fall back to keywords
 - card numbers masked by the guardrail never reach the conversation state or the classifier

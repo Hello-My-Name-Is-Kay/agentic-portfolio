@@ -2,7 +2,8 @@
 
 The agent runs on **AgentCore Runtime** (HTTP protocol, ARM64/Graviton). Conversation state is checkpointed to
 **AgentCore Memory**, every message is screened by **Bedrock Guardrails**, and intent is classified by **Claude on
-Bedrock**. The mock booking API runs beside the agent on localhost (demo only).
+Bedrock**. The mock booking API runs beside the agent on localhost (demo only): its data resets whenever AgentCore
+recycles the session's microVM, while the conversation itself stays in AgentCore Memory for 7 days.
 
 ```
 client ──SigV4──▶ AgentCore Runtime (microVM per session)
@@ -41,7 +42,7 @@ aws iam put-role-policy --role-name flagship-agent-runtime --policy-name runtime
 aws codebuild create-project --name flagship-agent-image \
   --source "type=S3,location=${BUCKET}/source/flagship-agent.zip,buildspec=flagship-agent/deploy/buildspec.yml" \
   --artifacts type=NO_ARTIFACTS --service-role "arn:aws:iam::${ACCOUNT_ID}:role/flagship-agent-codebuild" \
-  --environment "type=ARM_CONTAINER,image=aws/codebuild/amazonlinux-aarch64-standard:3.0,computeType=BUILD_GENERAL1_SMALL,privilegedMode=true,environmentVariables=[{name=ECR_REPOSITORY_URI,value=${REPO}},{name=IMAGE_TAG,value=v0.4.1}]"
+  --environment "type=ARM_CONTAINER,image=aws/codebuild/amazonlinux-aarch64-standard:3.0,computeType=BUILD_GENERAL1_SMALL,privilegedMode=true,environmentVariables=[{name=ECR_REPOSITORY_URI,value=${REPO}},{name=IMAGE_TAG,value=v0.4.2}]"
 ```
 
 In zsh, write `${ACCOUNT_ID}:role`, not `$ACCOUNT_ID:role`: `:r` is a zsh modifier and silently corrupts the ARN.
@@ -54,13 +55,29 @@ aws s3 cp source.zip s3://$BUCKET/source/flagship-agent.zip
 aws codebuild start-build --project-name flagship-agent-image
 
 aws bedrock-agentcore-control create-agent-runtime --agent-runtime-name flagship_agent \
-  --agent-runtime-artifact "{\"containerConfiguration\":{\"containerUri\":\"${REPO}:v0.4.1\"}}" \
+  --agent-runtime-artifact "{\"containerConfiguration\":{\"containerUri\":\"${REPO}:v0.4.2\"}}" \
   --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/flagship-agent-runtime" \
   --network-configuration '{"networkMode":"PUBLIC"}' --protocol-configuration '{"serverProtocol":"HTTP"}' \
   --environment-variables "{\"AGENT_LLM\":\"bedrock\",\"AGENT_AWS_REGION\":\"${REGION}\",\"AGENT_GUARDRAIL_ID\":\"${GUARDRAIL_ID}\",\"AGENT_GUARDRAIL_VERSION\":\"1\",\"AGENT_MEMORY_ID\":\"${MEMORY_ID}\"}"
 ```
 
 Callers are authenticated by AgentCore with IAM (SigV4). No secrets are passed as environment variables.
+
+## Monitoring
+
+The guardrail fails open, so a misconfiguration would silently let messages through unscreened. A metric filter on
+the runtime log group counts `guardrail.unavailable` warnings, and an alarm fires on the first one:
+
+```bash
+aws logs put-metric-filter --log-group-name /aws/bedrock-agentcore/runtimes/<runtime id>-DEFAULT \
+  --filter-name guardrail-unavailable --filter-pattern '"guardrail.unavailable"' \
+  --metric-transformations metricName=GuardrailUnavailable,metricNamespace=FlagshipAgent,metricValue=1,defaultValue=0
+aws cloudwatch put-metric-alarm --alarm-name flagship-agent-guardrail-unavailable --namespace FlagshipAgent \
+  --metric-name GuardrailUnavailable --statistic Sum --period 300 --evaluation-periods 1 --threshold 1 \
+  --comparison-operator GreaterThanOrEqualToThreshold --treat-missing-data notBreaching
+```
+
+Logs record message lengths only, never content, and keep 7 days.
 
 ## Invoke
 
@@ -73,6 +90,7 @@ aws bedrock-agentcore invoke-agent-runtime --agent-runtime-arn <runtime arn> --r
 ## Tear down
 
 ```bash
+aws cloudwatch delete-alarms --alarm-names flagship-agent-guardrail-unavailable
 aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id <runtime id>
 aws bedrock-agentcore-control delete-memory --memory-id $MEMORY_ID
 aws codebuild delete-project --name flagship-agent-image

@@ -12,16 +12,18 @@ import json
 import re
 from typing import Any, Literal
 
+from langgraph.runtime import Runtime
+
 from agent.config import AgentSettings
 from agent.intent import DATE, RESERVATION_ID, IntentClassifier
 from agent.logging import get_logger
-from agent.state import ACCOUNT_INTENTS, WRITE_INTENTS, AgentState, Message, PendingAction, ToolCall
+from agent.state import ACCOUNT_INTENTS, WRITE_INTENTS, AgentState, Message, PendingAction, ToolCall, TurnContext
 from agent.tools import AgentTools
 
 log = get_logger(__name__)
 
-_CUSTOMER_ID = re.compile(r"\bC-\d{5}\b")
-_PIN = re.compile(r"(?<![\d-])\d{4}(?![\d-])")
+CUSTOMER_ID = re.compile(r"\bC-\d{5}\b")
+PIN = re.compile(r"(?<![\d-])\d{4}(?![\d-])")  # removed from messages before they are stored
 
 _TRANSFER = "I'm transferring you to a colleague now."
 
@@ -59,15 +61,18 @@ class Nodes:
         log.info("node.start_turn", turn=turn)
         return update
 
-    async def authenticate(self, state: AgentState) -> StateUpdate:
-        """Verify credentials found in the message; credentials sent while a write is pending grant step-up."""
-        text = _last_user_text(state)
-        cid, pin = _CUSTOMER_ID.search(text), _PIN.search(text)
+    async def authenticate(self, state: AgentState, runtime: Runtime[TurnContext]) -> StateUpdate:
+        """Verify credentials; credentials sent while a write is pending grant step-up.
+
+        The customer ID comes from the stored message; the PIN only from the runtime context, which is never
+        checkpointed (the stored message shows ``[PIN]``).
+        """
+        cid, pin = CUSTOMER_ID.search(_last_user_text(state)), runtime.context.pin
         if not (cid and pin):
             return {}
         customer_id = cid.group()
         result, call = _call(
-            "authenticate", {"customer_id": customer_id}, await self._tools.authenticate(customer_id, pin.group())
+            "authenticate", {"customer_id": customer_id}, await self._tools.authenticate(customer_id, pin)
         )
         update: StateUpdate = {"tool_trace": [call]}
         if result["status"] != "ok":
@@ -94,7 +99,7 @@ class Nodes:
         text = _last_user_text(state)
         pending = state["pending"]
         auth_attempt = state["turn"] in (state["auth_ok_turn"], state["auth_fail_turn"])
-        intent = await self._classify(_PIN.sub("[PIN]", text), pending["intent"] if pending else None, auth_attempt)
+        intent = await self._classify(PIN.sub("[PIN]", text), pending["intent"] if pending else None, auth_attempt)
         rid = RESERVATION_ID.search(text)  # IDs and dates come from the text itself, never from the model
         date = DATE.search(text)
         reservation_id = rid.group() if rid else None

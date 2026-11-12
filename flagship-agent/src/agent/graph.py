@@ -5,7 +5,7 @@ from langgraph.graph import END, START, StateGraph
 from agent.config import AgentSettings
 from agent.intent import IntentClassifier
 from agent.nodes import Nodes, route_intent, route_start
-from agent.state import AgentState
+from agent.state import AgentState, TurnContext
 from agent.tools import AgentTools
 
 REPLY_NODES = (
@@ -20,10 +20,12 @@ REPLY_NODES = (
 )
 
 
-def build_graph(tools: AgentTools, settings: AgentSettings, classifier: IntentClassifier) -> StateGraph[AgentState]:
+def build_graph(
+    tools: AgentTools, settings: AgentSettings, classifier: IntentClassifier
+) -> StateGraph[AgentState, TurnContext]:
     """Wire nodes and conditional edges; compile the result with a checkpointer."""
     nodes = Nodes(tools, settings, classifier)
-    graph = StateGraph(AgentState)
+    graph = StateGraph(AgentState, context_schema=TurnContext)
 
     graph.add_node("start_turn", nodes.start_turn)
     graph.add_node("authenticate", nodes.authenticate)

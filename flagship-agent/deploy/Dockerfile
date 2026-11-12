@@ -1,6 +1,6 @@
 # ARM64 image for Amazon Bedrock AgentCore Runtime (Graviton). Build context: the repository root.
 #   docker build -f flagship-agent/deploy/Dockerfile .
-FROM --platform=linux/arm64 python:3.12.8-slim AS builder
+FROM --platform=linux/arm64 python:3.12.16-slim-trixie AS builder
 RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 WORKDIR /build
@@ -8,8 +8,10 @@ COPY mock-booking-api ./mock-booking-api
 COPY flagship-agent ./flagship-agent
 RUN pip install --no-cache-dir ./mock-booking-api "./flagship-agent[agentcore]"
 
-FROM --platform=linux/arm64 python:3.12.8-slim
-RUN useradd --system --uid 1001 --create-home appuser
+FROM --platform=linux/arm64 python:3.12.16-slim-trixie
+# Pull OS security fixes released after the base image was built (ECR scans on every push).
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 1001 --create-home appuser
 COPY --from=builder /opt/venv /opt/venv
 COPY --chmod=755 flagship-agent/deploy/start.sh /usr/local/bin/start.sh
 ENV PATH=/opt/venv/bin:$PATH \

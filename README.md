@@ -13,7 +13,7 @@ Each project has its own dependencies, tests, CI workflow and README. Every READ
 | 4 | **Mock Booking API** | FastAPI + Pydantic, OpenAPI spec, optional API key, request-scoped `Idempotency-Key`, one JSON error envelope | [mock-booking-api](mock-booking-api/) |
 | 5 | **MCP Server** | 3 booking tools on the MCP Python SDK (2.x), validated inputs, structured error codes, stdio demo with the MCP client | [mcp-server](mcp-server/) |
 | 6 | **Guardrails Suite** | Regex PII redaction, pattern-based injection detector, output validator; 36-case attack dataset with CI gate | [guardrails](guardrails/) |
-| 7 | **Flagship LangGraph Agent** | LangGraph `StateGraph` customer-service agent: auth, step-up for writes, ownership checks, handoff | [flagship-agent](flagship-agent/) |
+| 7 | **Flagship LangGraph Agent** | LangGraph `StateGraph` customer-service agent: auth, step-up for writes, ownership checks, handoff. Intent by Claude on Amazon Bedrock, every message screened by Bedrock Guardrails, deployed on Bedrock AgentCore Runtime (ARM64 container via CodeBuild → ECR) with state in AgentCore Memory; the PIN is never stored | [flagship-agent](flagship-agent/) |
 | 8 | **Ticket Automation Tool** | SQLite ticket queue CLI, parameterized SQL, idempotent writes, audit log that survives deletes, synthetic data only | [ticket-tool](ticket-tool/) |
 
 ## Stack

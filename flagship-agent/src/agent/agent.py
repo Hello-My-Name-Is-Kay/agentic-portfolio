@@ -13,7 +13,8 @@ from agent.graph import build_graph
 from agent.guardrail import InputGuardrail, make_guardrail
 from agent.intent import IntentClassifier, make_classifier
 from agent.logging import get_logger
-from agent.state import AgentState, Message, initial_state
+from agent.nodes import PIN
+from agent.state import AgentState, Message, TurnContext, initial_state
 from agent.tools import AgentTools
 
 if TYPE_CHECKING:
@@ -62,16 +63,19 @@ class CustomerServiceAgent:
             "recursion_limit": self._settings.recursion_limit,
         }
         with structlog.contextvars.bound_contextvars(request_id=request_id, thread_id=thread_id):
-            screened = await self._guardrail(user_input)  # masked before it is stored or logged
+            screened = await self._guardrail(user_input)  # cards, emails, phones masked before storage or logs
+            pin = PIN.search(screened.text)  # the PIN travels in the runtime context, never in stored state
+            text = PIN.sub("[PIN]", screened.text)
             snapshot = await self.graph.aget_state(config)
             update: dict[str, Any] = {} if snapshot.values else initial_state()
             update |= {
                 "request_id": request_id,
-                "messages": [Message(role="user", content=screened.text)],
+                "messages": [Message(role="user", content=text)],
                 "guard_blocked": screened.blocked_by,
             }
-            log.info("agent.turn.start", input_chars=len(screened.text))  # never log message content
-            state = cast("AgentState", await self.graph.ainvoke(cast("AgentState", update), config))
+            log.info("agent.turn.start", input_chars=len(text))  # never log message content
+            context = TurnContext(pin=pin.group() if pin else None)
+            state = cast("AgentState", await self.graph.ainvoke(cast("AgentState", update), config, context=context))
             log.info(
                 "agent.turn.end", turn=state["turn"], intent=state["intent"], handoff=bool(state["handoff_reason"])
             )

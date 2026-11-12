@@ -62,17 +62,6 @@
         "bedrock-agentcore:ListSessions"
       ],
       "Resource": "arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}:memory/${MEMORY_ID}"
-    },
-    {
-      "Sid": "Metrics",
-      "Effect": "Allow",
-      "Action": "cloudwatch:PutMetricData",
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "cloudwatch:namespace": "bedrock-agentcore"
-        }
-      }
     }
   ]
 }
