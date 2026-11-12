@@ -200,6 +200,15 @@ class Nodes:
             "or answer policy questions. What would you like to do?"
         )
 
+    async def refuse(self, state: AgentState) -> StateUpdate:
+        """Decline a message the guardrail blocked; no tool runs and the classifier never sees it."""
+        error = f"Guardrail blocked the message: {state['guard_blocked']}"
+        update: StateUpdate = {"intent": "unknown", "errors": [error]}
+        return update | _say(
+            "Sorry, I can't help with that request. I can look up, change or cancel a reservation, "
+            "or answer questions about our rental policies."
+        )
+
     async def handoff(self, state: AgentState) -> StateUpdate:
         """Transfer to a human colleague; later turns just confirm the transfer."""
         already = any(m["role"] == "assistant" and m["content"].startswith(_TRANSFER) for m in state["messages"])
@@ -210,9 +219,11 @@ class Nodes:
         return {"handoff_reason": reason} | _say(f"{_TRANSFER} Reason: {reason}")
 
 
-def route_start(state: AgentState) -> Literal["handoff", "authenticate"]:
-    """Skip straight to handoff once a conversation is over its limit."""
-    return "handoff" if state["handoff_reason"] else "authenticate"
+def route_start(state: AgentState) -> Literal["handoff", "refuse", "authenticate"]:
+    """Skip to handoff once a conversation is over its limit, or refuse a message the guardrail blocked."""
+    if state["handoff_reason"]:
+        return "handoff"
+    return "refuse" if state["guard_blocked"] else "authenticate"
 
 
 def route_intent(

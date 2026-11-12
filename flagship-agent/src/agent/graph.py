@@ -28,12 +28,14 @@ def build_graph(tools: AgentTools, settings: AgentSettings, classifier: IntentCl
     graph.add_node("start_turn", nodes.start_turn)
     graph.add_node("authenticate", nodes.authenticate)
     graph.add_node("classify_intent", nodes.classify_intent)
+    graph.add_node("refuse", nodes.refuse)
+    graph.add_edge("refuse", END)
     for name in REPLY_NODES:
         graph.add_node(name, getattr(nodes, name))
         graph.add_edge(name, END)
 
     graph.add_edge(START, "start_turn")
-    graph.add_conditional_edges("start_turn", route_start, ["handoff", "authenticate"])
+    graph.add_conditional_edges("start_turn", route_start, ["handoff", "refuse", "authenticate"])
     graph.add_edge("authenticate", "classify_intent")
     graph.add_conditional_edges("classify_intent", route_intent, list(REPLY_NODES))
     return graph

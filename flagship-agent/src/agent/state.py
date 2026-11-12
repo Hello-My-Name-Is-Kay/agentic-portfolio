@@ -54,6 +54,7 @@ class AgentState(TypedDict):
     intent: Intent
     pending: PendingAction | None
     handoff_reason: str | None
+    guard_blocked: str | None  # filters that blocked this turn's message, set before the graph runs
 
 
 def initial_state() -> dict[str, Any]:
@@ -69,4 +70,5 @@ def initial_state() -> dict[str, Any]:
         "intent": "unknown",
         "pending": None,
         "handoff_reason": None,
+        "guard_blocked": None,
     }

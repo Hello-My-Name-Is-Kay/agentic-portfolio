@@ -10,6 +10,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from agent.config import AgentSettings
 from agent.graph import build_graph
+from agent.guardrail import InputGuardrail, make_guardrail
 from agent.intent import IntentClassifier, make_classifier
 from agent.logging import get_logger
 from agent.state import AgentState, Message, initial_state
@@ -38,12 +39,14 @@ class CustomerServiceAgent:
         tools: AgentTools | None = None,
         checkpointer: BaseCheckpointSaver[Any] | None = None,
         classifier: IntentClassifier | None = None,
+        guardrail: InputGuardrail | None = None,
     ) -> None:
         """Compile the graph; defaults to the configured booking API, classifier and an in-memory checkpointer."""
         self._settings = settings or AgentSettings()
         self._tools = tools or AgentTools(
             booking_api_base=self._settings.booking_api_base, api_key=self._settings.booking_api_key
         )
+        self._guardrail = guardrail or make_guardrail(self._settings)
         classifier = classifier or make_classifier(self._settings)
         graph = build_graph(self._tools, self._settings, classifier)
         self.graph = graph.compile(checkpointer=checkpointer or InMemorySaver())
@@ -55,12 +58,16 @@ class CustomerServiceAgent:
             "configurable": {"thread_id": thread_id},
             "recursion_limit": self._settings.recursion_limit,
         }
-        snapshot = await self.graph.aget_state(config)
-        update: dict[str, Any] = {} if snapshot.values else initial_state()
-        update |= {"request_id": request_id, "messages": [Message(role="user", content=user_input)]}
-
         with structlog.contextvars.bound_contextvars(request_id=request_id, thread_id=thread_id):
-            log.info("agent.turn.start", input_preview=user_input[:80])
+            screened = await self._guardrail(user_input)  # masked before it is stored or logged
+            snapshot = await self.graph.aget_state(config)
+            update: dict[str, Any] = {} if snapshot.values else initial_state()
+            update |= {
+                "request_id": request_id,
+                "messages": [Message(role="user", content=screened.text)],
+                "guard_blocked": screened.blocked_by,
+            }
+            log.info("agent.turn.start", input_preview=screened.text[:80])
             state = cast("AgentState", await self.graph.ainvoke(cast("AgentState", update), config))
             log.info(
                 "agent.turn.end", turn=state["turn"], intent=state["intent"], handoff=bool(state["handoff_reason"])

@@ -22,4 +22,7 @@ class AgentSettings(BaseSettings):
     aws_region: str = "eu-north-1"
     llm_max_tokens: int = 100
 
+    guardrail_id: str = ""  # Bedrock guardrail screening every message; empty = no screening
+    guardrail_version: str = "1"  # always a pinned version, never DRAFT
+
     model_config = SettingsConfigDict(env_file=".env", extra="forbid", env_prefix="AGENT_")

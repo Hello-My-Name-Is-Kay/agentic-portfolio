@@ -1,0 +1,99 @@
+{
+ "name": "flagship-agent-guardrail",
+ "description": "Screens customer messages for the car-rental customer-service agent (portfolio demo).",
+ "blockedInputMessaging": "Sorry, I can't help with that request. I can look up, change or cancel a reservation, or answer questions about our rental policies.",
+ "blockedOutputsMessaging": "Sorry, I can't share that. I can look up, change or cancel a reservation, or answer questions about our rental policies.",
+ "contentPolicyConfig": {
+  "filtersConfig": [
+   {
+    "type": "PROMPT_ATTACK",
+    "inputStrength": "HIGH",
+    "outputStrength": "NONE"
+   },
+   {
+    "type": "HATE",
+    "inputStrength": "MEDIUM",
+    "outputStrength": "MEDIUM"
+   },
+   {
+    "type": "INSULTS",
+    "inputStrength": "MEDIUM",
+    "outputStrength": "MEDIUM"
+   },
+   {
+    "type": "SEXUAL",
+    "inputStrength": "MEDIUM",
+    "outputStrength": "MEDIUM"
+   },
+   {
+    "type": "VIOLENCE",
+    "inputStrength": "MEDIUM",
+    "outputStrength": "MEDIUM"
+   },
+   {
+    "type": "MISCONDUCT",
+    "inputStrength": "MEDIUM",
+    "outputStrength": "MEDIUM"
+   }
+  ]
+ },
+ "sensitiveInformationPolicyConfig": {
+  "piiEntitiesConfig": [
+   {
+    "type": "CREDIT_DEBIT_CARD_NUMBER",
+    "action": "ANONYMIZE",
+    "inputAction": "ANONYMIZE",
+    "outputAction": "ANONYMIZE",
+    "inputEnabled": true,
+    "outputEnabled": true
+   },
+   {
+    "type": "CREDIT_DEBIT_CARD_CVV",
+    "action": "ANONYMIZE",
+    "inputAction": "ANONYMIZE",
+    "outputAction": "ANONYMIZE",
+    "inputEnabled": true,
+    "outputEnabled": true
+   },
+   {
+    "type": "CREDIT_DEBIT_CARD_EXPIRY",
+    "action": "ANONYMIZE",
+    "inputAction": "ANONYMIZE",
+    "outputAction": "ANONYMIZE",
+    "inputEnabled": true,
+    "outputEnabled": true
+   },
+   {
+    "type": "EMAIL",
+    "action": "ANONYMIZE",
+    "inputAction": "ANONYMIZE",
+    "outputAction": "ANONYMIZE",
+    "inputEnabled": true,
+    "outputEnabled": true
+   },
+   {
+    "type": "PHONE",
+    "action": "ANONYMIZE",
+    "inputAction": "ANONYMIZE",
+    "outputAction": "ANONYMIZE",
+    "inputEnabled": true,
+    "outputEnabled": true
+   }
+  ]
+ },
+ "topicPolicyConfig": {
+  "topicsConfig": [
+   {
+    "name": "Legal-or-financial-advice",
+    "definition": "Requests for legal advice (lawsuits, liability claims, contracts law) or financial and investment advice that a car-rental customer-service agent must not give.",
+    "examples": [
+     "Can I sue you for this?",
+     "Should I invest in car rental stocks?",
+     "Am I legally liable for the accident?",
+     "What is the best way to invest my savings?"
+    ],
+    "type": "DENY"
+   }
+  ]
+ }
+}
