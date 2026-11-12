@@ -10,6 +10,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from agent.config import AgentSettings
 from agent.graph import build_graph
+from agent.intent import IntentClassifier, make_classifier
 from agent.logging import get_logger
 from agent.state import AgentState, Message, initial_state
 from agent.tools import AgentTools
@@ -36,13 +37,16 @@ class CustomerServiceAgent:
         settings: AgentSettings | None = None,
         tools: AgentTools | None = None,
         checkpointer: BaseCheckpointSaver[Any] | None = None,
+        classifier: IntentClassifier | None = None,
     ) -> None:
-        """Compile the graph; defaults to the configured booking API and an in-memory checkpointer."""
+        """Compile the graph; defaults to the configured booking API, classifier and an in-memory checkpointer."""
         self._settings = settings or AgentSettings()
         self._tools = tools or AgentTools(
             booking_api_base=self._settings.booking_api_base, api_key=self._settings.booking_api_key
         )
-        self.graph = build_graph(self._tools, self._settings).compile(checkpointer=checkpointer or InMemorySaver())
+        classifier = classifier or make_classifier(self._settings)
+        graph = build_graph(self._tools, self._settings, classifier)
+        self.graph = graph.compile(checkpointer=checkpointer or InMemorySaver())
 
     async def run(self, user_input: str, thread_id: str = "default") -> AgentState:
         """Process one user message in a conversation thread and return the thread's full state."""

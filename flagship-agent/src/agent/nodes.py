@@ -4,8 +4,8 @@ One graph invocation handles one user turn:
 
     start_turn → authenticate → classify_intent → (route) → one reply node → END
 
-Intent classification is keyword-based so behaviour is deterministic in tests;
-``classify`` is the single place to swap in an LLM classifier.
+Intent classification is injected (keywords, or Claude on Bedrock; see ``agent.intent``).
+The model never sees the PIN and never decides what is allowed: the routing below does.
 """
 
 import json
@@ -13,46 +13,19 @@ import re
 from typing import Any, Literal
 
 from agent.config import AgentSettings
+from agent.intent import DATE, RESERVATION_ID, IntentClassifier
 from agent.logging import get_logger
-from agent.state import ACCOUNT_INTENTS, WRITE_INTENTS, AgentState, Intent, Message, PendingAction, ToolCall
+from agent.state import ACCOUNT_INTENTS, WRITE_INTENTS, AgentState, Message, PendingAction, ToolCall
 from agent.tools import AgentTools
 
 log = get_logger(__name__)
 
 _CUSTOMER_ID = re.compile(r"\bC-\d{5}\b")
 _PIN = re.compile(r"(?<![\d-])\d{4}(?![\d-])")
-_RESERVATION_ID = re.compile(r"\bR-\d{5}\b")
-_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
-
-_HANDOFF = re.compile(r"\b(human|real person|manager|supervisor|talk to|speak to|operator)\b")
-_POLICY = re.compile(r"\b(policy|policies|rules?|fees?|what is|what's|how does|how do|can i|tell me about)\b")
-_CANCEL = re.compile(r"\bcancel\b")
-_CHANGE = re.compile(r"\b(change|extend|reschedule|move|modify|postpone)\b")
-_LOOKUP = re.compile(r"\b(look ?up|check|status|details|find|my reservation|reservation)\b")
-_GREETING = re.compile(r"\b(hello|hi|hey|good (morning|afternoon|evening))\b")
 
 _TRANSFER = "I'm transferring you to a colleague now."
 
 StateUpdate = dict[str, Any]
-
-
-def classify(text: str) -> Intent:
-    """Map a user message to an intent."""
-    t = text.lower()
-    has_reservation = bool(_RESERVATION_ID.search(text))
-    if _HANDOFF.search(t):
-        return "handoff"
-    if _POLICY.search(t) and not has_reservation:
-        return "policy"
-    if _CANCEL.search(t):
-        return "cancel"
-    if _CHANGE.search(t):
-        return "change"
-    if _LOOKUP.search(t) or has_reservation:
-        return "lookup"
-    if _GREETING.search(t):
-        return "greeting"
-    return "unknown"
 
 
 def _last_user_text(state: AgentState) -> str:
@@ -71,10 +44,11 @@ def _call(name: str, args: dict[str, str], raw: str) -> tuple[dict[str, Any], To
 class Nodes:
     """Graph nodes bound to one set of tools and settings."""
 
-    def __init__(self, tools: AgentTools, settings: AgentSettings) -> None:
-        """Bind the nodes to the tools and limits they use."""
+    def __init__(self, tools: AgentTools, settings: AgentSettings, classifier: IntentClassifier) -> None:
+        """Bind the nodes to the tools, limits and intent classifier they use."""
         self._tools = tools
         self._settings = settings
+        self._classify = classifier
 
     async def start_turn(self, state: AgentState) -> StateUpdate:
         """Count the turn and hand off once the conversation runs too long."""
@@ -118,18 +92,13 @@ class Nodes:
     async def classify_intent(self, state: AgentState) -> StateUpdate:
         """Classify the turn and keep the account action it refers to in ``pending``."""
         text = _last_user_text(state)
-        intent = classify(text)
         pending = state["pending"]
-        rid = _RESERVATION_ID.search(text)
-        date = _DATE.search(text)
+        auth_attempt = state["turn"] in (state["auth_ok_turn"], state["auth_fail_turn"])
+        intent = await self._classify(_PIN.sub("[PIN]", text), pending["intent"] if pending else None, auth_attempt)
+        rid = RESERVATION_ID.search(text)  # IDs and dates come from the text itself, never from the model
+        date = DATE.search(text)
         reservation_id = rid.group() if rid else None
         new_date = date.group() if date else None
-
-        keywords_only = classify(_DATE.sub(" ", _RESERVATION_ID.sub(" ", text)))
-        if keywords_only in ("unknown", "greeting") and pending is not None:
-            auth_attempt_now = state["turn"] in (state["auth_ok_turn"], state["auth_fail_turn"])
-            if auth_attempt_now or reservation_id or new_date:
-                intent = pending["intent"]
 
         update: StateUpdate = {"intent": intent}
         if intent in ACCOUNT_INTENTS:

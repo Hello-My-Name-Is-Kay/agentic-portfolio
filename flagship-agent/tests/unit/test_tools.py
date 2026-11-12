@@ -7,7 +7,7 @@ import json
 import httpx
 import pytest
 
-from agent.nodes import classify
+from agent.intent import classify_keywords as classify
 from agent.tools import AgentTools, AuthenticateArgs, CancelReservationArgs, ChangeReservationArgs
 from fakes import FakeBookingApi
 

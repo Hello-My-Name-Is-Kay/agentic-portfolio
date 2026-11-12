@@ -8,12 +8,13 @@ from agent.agent import CustomerServiceAgent, last_reply, trajectory
 from agent.cli import run_json
 from agent.config import AgentSettings
 from agent.graph import build_graph
+from agent.intent import KeywordClassifier
 from agent.tools import AgentTools
 from fakes import FakeBookingApi
 
 
 async def test_graph_has_expected_nodes(tools: AgentTools) -> None:
-    nodes = set(build_graph(tools, AgentSettings()).compile().get_graph().nodes)
+    nodes = set(build_graph(tools, AgentSettings(), KeywordClassifier()).compile().get_graph().nodes)
     assert {"start_turn", "authenticate", "classify_intent", "run_account_tool", "request_step_up"} <= nodes
 
 
